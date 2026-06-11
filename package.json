@@ -1,0 +1,10 @@
+{
+  "name": "firestream-dav",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "HLS ingest server for FireStream encoding pipeline",
+  "main": "ingest.js",
+  "scripts": {
+    "start": "node ingest.js"
+  }
+}
