@@ -1,0 +1,123 @@
+# FireStream Ingest — ingest-XX.firestream.to
+# Serves: HLS streams, misc (posters/thumbnails), DAV ingest proxy
+
+server {
+    listen 80;
+    listen [::]:80;
+    server_name __DOMAIN__;
+
+    location /.well-known/acme-challenge/ {
+        root /var/www/html;
+    }
+
+    location / {
+        return 301 https://$host$request_uri;
+    }
+}
+
+server {
+    listen 443 ssl http2;
+    listen [::]:443 ssl http2;
+    server_name __DOMAIN__;
+
+    ssl_certificate /etc/letsencrypt/live/__DOMAIN__/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/__DOMAIN__/privkey.pem;
+
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305;
+    ssl_prefer_server_ciphers on;
+    ssl_session_cache shared:SSL:50m;
+    ssl_session_timeout 1d;
+    ssl_session_tickets off;
+
+    ssl_stapling on;
+    ssl_stapling_verify on;
+
+    # ── Encodings (HLS streams) ────────────────────────────────────
+    location ^~ /encodings/ {
+        root /home/server;
+
+        sendfile on;
+        tcp_nopush on;
+        tcp_nodelay on;
+
+        add_header Access-Control-Allow-Origin "*" always;
+        add_header Access-Control-Allow-Methods "GET, HEAD, OPTIONS" always;
+        add_header Access-Control-Allow-Headers "Range, Accept, Content-Type" always;
+
+        # HLS playlists — low cache
+        location ~* \.m3u8$ {
+            expires 1s;
+            add_header Cache-Control "public, no-cache";
+            add_header Access-Control-Allow-Origin "*" always;
+            types {
+                application/vnd.apple.mpegurl m3u8;
+            }
+            gzip on;
+        }
+
+        # HLS segments — medium cache
+        location ~* \.ts$ {
+            limit_rate 25m;
+            expires 10m;
+            add_header Cache-Control "public, max-age=600";
+            add_header Access-Control-Allow-Origin "*" always;
+            aio off;
+            types {
+                video/mp2t ts;
+            }
+            gzip off;
+        }
+
+        # WebVTT thumbnails
+        location ~* \.vtt$ {
+            expires 1h;
+            add_header Cache-Control "public, max-age=3600";
+            add_header Access-Control-Allow-Origin "*" always;
+            types {
+                text/vtt vtt;
+            }
+            gzip on;
+        }
+
+        # Poster / thumbnail images
+        location ~* \.(jpg|jpeg|png|gif|webp)$ {
+            expires 30d;
+            add_header Cache-Control "public, immutable";
+            add_header Access-Control-Allow-Origin "*" always;
+        }
+    }
+
+    # ── Misc (posters, thumbnails, scrub sprites) ──────────────────
+    location ^~ /misc/ {
+        root /home/server;
+
+        sendfile on;
+        tcp_nopush on;
+
+        expires 30d;
+        add_header Cache-Control "public, immutable";
+        add_header Access-Control-Allow-Origin "*" always;
+
+        include /etc/nginx/mime.types;
+        default_type application/octet-stream;
+    }
+
+    # ── DAV Ingest (proxy PUTs from encoder servers) ───────────────
+    location / {
+        proxy_pass http://127.0.0.1:2999;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        client_max_body_size 0;
+        client_body_timeout 7200s;
+        proxy_request_buffering off;
+        proxy_buffering off;
+        proxy_connect_timeout 7200s;
+        proxy_send_timeout 7200s;
+        proxy_read_timeout 7200s;
+    }
+}
