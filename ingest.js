@@ -6,16 +6,17 @@ import { INGEST_DIR, PORT, isAllowed } from './config.js'
 // Allowed file extensions for ingest
 const ALLOWED_EXTENSIONS = new Set(['.ts', '.m3u8', '.jpg', '.png', '.vtt'])
 
-// Request timeout (120s)
+// Request timeout (120s) — only triggers on stalled transfers
 const REQUEST_TIMEOUT_MS = 120_000
+
+// Stale .tmp cleanup interval (60s)
+const TMP_CLEANUP_INTERVAL_MS = 60_000
+const TMP_MAX_AGE_MS = 300_000 // 5 minutes
 
 // Stats
 let totalIngested = 0
 let activeRequests = 0
 const startTime = Date.now()
-
-// Track in-flight requests for graceful shutdown
-const inflightRequests = new Set()
 
 function log(msg) {
   const ts = new Date().toISOString()
@@ -24,46 +25,29 @@ function log(msg) {
 
 // Validate and resolve the PUT path
 function resolvePath(url) {
-  // Decode URL, strip query string
   const decoded = decodeURIComponent(url.split('?')[0])
-
-  // Normalize — resolves /../ etc.
   const normalized = path.normalize(decoded)
 
-  // Reject any path that tries to escape (has .. segments after normalize)
-  if (normalized.includes('..')) {
-    return null
-  }
+  if (normalized.includes('..')) return null
 
-  // Must start with / and have at least /{userId}/{videoId}/{filename}
   const parts = normalized.split('/').filter(Boolean)
-  if (parts.length < 3) {
-    return null
-  }
+  if (parts.length < 3) return null
 
   const filename = parts[parts.length - 1]
   const ext = path.extname(filename).toLowerCase()
-  if (!ALLOWED_EXTENSIONS.has(ext)) {
-    return null
-  }
+  if (!ALLOWED_EXTENSIONS.has(ext)) return null
 
-  // Build absolute path
   const filePath = path.join(INGEST_DIR, normalized)
-
-  // Final safety — must be under INGEST_DIR
-  if (!filePath.startsWith(INGEST_DIR)) {
-    return null
-  }
+  if (!filePath.startsWith(INGEST_DIR)) return null
 
   return filePath
 }
 
-// Atomic write: write to .tmp, then rename
+// Atomic write: write to .tmp, then rename on completion
 function atomicWrite(filePath, req, res) {
   const tmpPath = filePath + '.tmp'
   const dir = path.dirname(filePath)
 
-  // Ensure directory exists
   fs.mkdir(dir, { recursive: true }, (err) => {
     if (err) {
       log(`ERROR mkdir ${dir}: ${err.message}`)
@@ -73,18 +57,20 @@ function atomicWrite(filePath, req, res) {
 
     const ws = fs.createWriteStream(tmpPath)
     let bytes = 0
+    let finished = false
 
-    req.on('data', (chunk) => {
-      bytes += chunk.length
-    })
+    // Track bytes from request
+    req.on('data', (chunk) => { bytes += chunk.length })
 
+    // Pipe request body to file
     req.pipe(ws)
 
+    // Write stream finished — all data flushed to disk
     ws.on('finish', () => {
+      finished = true
       fs.rename(tmpPath, filePath, (renameErr) => {
         if (renameErr) {
           log(`ERROR rename ${tmpPath} → ${filePath}: ${renameErr.message}`)
-          // Cleanup tmp on failed rename
           fs.unlink(tmpPath, () => {})
           res.writeHead(500)
           return res.end()
@@ -98,12 +84,24 @@ function atomicWrite(filePath, req, res) {
       })
     })
 
+    // Write stream error — cleanup tmp
     ws.on('error', (writeErr) => {
+      if (finished) return
+      finished = true
       log(`ERROR write ${tmpPath}: ${writeErr.message}`)
-      // Cleanup tmp on write error
       fs.unlink(tmpPath, () => {})
       res.writeHead(500)
       res.end()
+    })
+
+    // Request connection dropped before write stream finished
+    req.on('close', () => {
+      if (finished) return
+      finished = true
+      // Destroy the write stream to stop flushing
+      ws.destroy()
+      log(`ABORT partial write: ${tmpPath} (${formatBytes(bytes)})`)
+      fs.unlink(tmpPath, () => {})
     })
   })
 }
@@ -125,6 +123,36 @@ function handleHealth(req, res) {
   })
   res.writeHead(200, { 'Content-Type': 'application/json' })
   res.end(body)
+}
+
+// Periodic cleanup of stale .tmp files
+function cleanupTmpFiles() {
+  const now = Date.now()
+  let cleaned = 0
+
+  function scanDir(dir) {
+    let entries
+    try { entries = fs.readdirSync(dir, { withFileTypes: true }) } catch { return }
+    for (const entry of entries) {
+      const full = path.join(dir, entry.name)
+      if (entry.isDirectory()) {
+        scanDir(full)
+      } else if (entry.name.endsWith('.tmp')) {
+        try {
+          const stat = fs.statSync(full)
+          if (now - stat.mtimeMs > TMP_MAX_AGE_MS) {
+            fs.unlinkSync(full)
+            cleaned++
+          }
+        } catch {}
+      }
+    }
+  }
+
+  scanDir(INGEST_DIR)
+  if (cleaned > 0) {
+    log(`cleanup: removed ${cleaned} stale .tmp files`)
+  }
 }
 
 const server = http.createServer((req, res) => {
@@ -158,23 +186,17 @@ const server = http.createServer((req, res) => {
 
   // Track for graceful shutdown
   activeRequests++
-  inflightRequests.add(req)
 
-  // Request timeout
+  // Request timeout — stall detection
   const timer = setTimeout(() => {
     log(`TIMEOUT PUT ${req.url} (${REQUEST_TIMEOUT_MS}ms)`)
     req.destroy()
   }, REQUEST_TIMEOUT_MS)
 
-  // Cleanup on request close
-  const cleanup = () => {
+  req.on('close', () => {
     clearTimeout(timer)
     activeRequests--
-    inflightRequests.delete(req)
-  }
-
-  req.on('close', cleanup)
-  req.on('error', cleanup)
+  })
 
   atomicWrite(filePath, req, res)
 })
@@ -187,13 +209,11 @@ function shutdown(signal) {
   shuttingDown = true
   log(`${signal} received — shutting down (active: ${activeRequests})`)
 
-  // Stop accepting new connections
   server.close(() => {
     log('Server closed')
     process.exit(0)
   })
 
-  // Hard cutoff after 15s
   setTimeout(() => {
     log('Forced shutdown after timeout')
     process.exit(1)
@@ -203,7 +223,12 @@ function shutdown(signal) {
 process.on('SIGTERM', () => shutdown('SIGTERM'))
 process.on('SIGINT', () => shutdown('SIGINT'))
 
+// Start stale .tmp cleanup
+setInterval(cleanupTmpFiles, TMP_CLEANUP_INTERVAL_MS)
+
 server.listen(PORT, () => {
   log(`ingest listening on :${PORT}`)
   log(`ingest dir: ${INGEST_DIR}`)
+  // Run cleanup on startup
+  cleanupTmpFiles()
 })
