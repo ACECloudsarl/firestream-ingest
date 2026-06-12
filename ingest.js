@@ -1,7 +1,7 @@
 import http from 'node:http'
 import fs from 'node:fs'
 import path from 'node:path'
-import { INGEST_DIR, PORT, isAllowed } from './config.js'
+import { INGEST_DIR, MISC_DIR, PORT, isAllowed } from './config.js'
 
 // Allowed file extensions for ingest
 const ALLOWED_EXTENSIONS = new Set(['.ts', '.m3u8', '.jpg', '.png', '.vtt'])
@@ -37,8 +37,23 @@ function resolvePath(url) {
   const ext = path.extname(filename).toLowerCase()
   if (!ALLOWED_EXTENSIONS.has(ext)) return null
 
-  const filePath = path.join(INGEST_DIR, normalized)
-  if (!filePath.startsWith(INGEST_DIR)) return null
+  // /misc/{userId}/... → MISC_DIR
+  // /{userId}/{videoId}/... → INGEST_DIR
+  let basePath = INGEST_DIR
+  let relPath = normalized
+
+  if (parts[0] === 'misc') {
+    basePath = MISC_DIR
+    relPath = '/' + parts.slice(1).join('/')
+    // Need at least /{userId}/posters/{filename} or /{userId}/thumbnails/{filename}
+    if (parts.length < 4) return null
+  } else {
+    // /{userId}/{videoId}/{filename}
+    if (parts.length < 3) return null
+  }
+
+  const filePath = path.join(basePath, relPath)
+  if (!filePath.startsWith(basePath)) return null
 
   return filePath
 }
@@ -84,7 +99,7 @@ function atomicWrite(filePath, req, res) {
       })
     })
 
-    // Write stream error — cleanup tmp
+    // Write stream error — connection dropped or disk error, cleanup tmp
     ws.on('error', (writeErr) => {
       if (finished) return
       finished = true
@@ -92,16 +107,6 @@ function atomicWrite(filePath, req, res) {
       fs.unlink(tmpPath, () => {})
       res.writeHead(500)
       res.end()
-    })
-
-    // Request connection dropped before write stream finished
-    req.on('close', () => {
-      if (finished) return
-      finished = true
-      // Destroy the write stream to stop flushing
-      ws.destroy()
-      log(`ABORT partial write: ${tmpPath} (${formatBytes(bytes)})`)
-      fs.unlink(tmpPath, () => {})
     })
   })
 }

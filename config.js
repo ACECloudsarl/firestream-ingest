@@ -22,6 +22,7 @@ function loadEnv() {
 loadEnv()
 
 export const INGEST_DIR = process.env.INGEST_DIR || '/home/server/encodings'
+export const MISC_DIR = process.env.MISC_DIR || '/home/server/misc'
 export const PORT = parseInt(process.env.PORT || '2999', 10)
 
 // Allowed IPs — loaded from allowed_ips.json, reloadable via SIGHUP
