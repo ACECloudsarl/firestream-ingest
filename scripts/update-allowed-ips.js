@@ -6,7 +6,7 @@ import pg from 'pg'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const IPS_FILE = path.join(__dirname, '..', 'allowed_ips.json')
-const DATABASE_URL = process.env.DATABASE_URL || 'postgresql://firestream:SiMoX1234%40%40@178.105.14.120:5432/openvibe'
+const DATABASE_URL = process.env.DATABASE_URL || 'postgresql://firestream:SiMoX1234%40%40@204.168.236.110:5432/openvibe'
 
 async function main() {
   console.log('[update-ips] querying Server table for active encoder IPs...')

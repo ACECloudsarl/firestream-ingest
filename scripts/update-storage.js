@@ -2,7 +2,7 @@ import { execSync } from 'node:child_process'
 import pg from 'pg'
 import { INGEST_DIR } from '../config.js'
 
-const DATABASE_URL = process.env.DATABASE_URL || 'postgresql://firestream:SiMoX1234%40%40@178.105.14.120:5432/openvibe'
+const DATABASE_URL = process.env.DATABASE_URL || 'postgresql://firestream:SiMoX1234%40%40@204.168.236.110:5432/openvibe'
 
 function getLocalIp() {
   const raw = execSync("hostname -I", { encoding: "utf8" }).trim()
