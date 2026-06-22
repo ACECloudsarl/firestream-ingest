@@ -1,4 +1,5 @@
 import { execSync } from 'node:child_process'
+import { readFileSync } from 'node:fs'
 import pg from 'pg'
 import { INGEST_DIR } from '../config.js'
 
@@ -20,6 +21,92 @@ function getDiskUsage(mountPath) {
   return { free, used, total }
 }
 
+function readProcStat() {
+  const raw = readFileSync('/proc/stat', 'utf8')
+  const line = raw.split('\n')[0] // first line = aggregate CPU
+  const parts = line.split(/\s+/).slice(1) // drop 'cpu', keep numbers
+  const vals = parts.map(Number)
+  // user nice system idle iowait irq softirq steal guest guest_nice
+  const idle = vals[3] + (vals[4] || 0) // idle + iowait
+  const total = vals.reduce((a, b) => a + b, 0)
+  return { idle, total }
+}
+
+function getCpuUsage() {
+  // Two samples 500ms apart
+  const a = readProcStat()
+  execSync('sleep 0.5')
+  const b = readProcStat()
+  const idleDelta = b.idle - a.idle
+  const totalDelta = b.total - a.total
+  if (totalDelta === 0) return 0
+  return Math.round((1 - idleDelta / totalDelta) * 100)
+}
+
+function getRamUsage() {
+  const raw = readFileSync('/proc/meminfo', 'utf8')
+  const get = (key) => {
+    const m = raw.match(new RegExp(`^${key}:\\s+(\\d+)`, 'm'))
+    return m ? parseInt(m[1], 10) : 0
+  }
+  const total = get('MemTotal')
+  const available = get('MemAvailable')
+  if (total === 0) return 0
+  return Math.round(((total - available) / total) * 100)
+}
+
+function getBlockDevice(mountPath) {
+  const raw = execSync(`df "${mountPath}"`, { encoding: 'utf8' })
+  const lines = raw.trim().split('\n')
+  const dev = lines[1].split(/\s+/)[0] // e.g. /dev/sda1 or /dev/md2
+  // Strip /dev/ prefix to get the name used in /proc/diskstats
+  return dev.replace('/dev/', '')
+}
+
+function readDiskStats(device) {
+  const raw = readFileSync('/proc/diskstats', 'utf8')
+  for (const line of raw.split('\n')) {
+    const parts = line.trim().split(/\s+/)
+    if (parts[2] === device) {
+      // fields: major minor name reads rmerged rsectors rms writes wmerged wsectors wms inprog ioms iowms
+      const sectorsRead = parseInt(parts[5], 10) || 0
+      const sectorsWritten = parseInt(parts[9], 10) || 0
+      const msReading = parseInt(parts[6], 10) || 0
+      const msWriting = parseInt(parts[10], 10) || 0
+      const iosInProgress = parseInt(parts[11], 10) || 0
+      const msDoingIO = parseInt(parts[12], 10) || 0
+      return { sectorsRead, sectorsWritten, msReading, msWriting, iosInProgress, msDoingIO }
+    }
+  }
+  return null
+}
+
+function getDiskIO(mountPath) {
+  const device = getBlockDevice(mountPath)
+  // Try exact match first, then fall back to stripping partition number (sda1 → sda)
+  let a = readDiskStats(device)
+  if (!a) {
+    const base = device.replace(/\d+$/, '')
+    if (base !== device) a = readDiskStats(base)
+  }
+  if (!a) return { readKBps: 0, writeKBps: 0, iowait: 0 }
+
+  execSync('sleep 0.5')
+
+  let b = readDiskStats(device)
+  if (!b) {
+    const base = device.replace(/\d+$/, '')
+    if (base !== device) b = readDiskStats(base)
+  }
+  if (!b) return { readKBps: 0, writeKBps: 0, iowait: 0 }
+
+  const secs = 0.5
+  const readKBps = Math.round(((b.sectorsRead - a.sectorsRead) * 512) / (1024 * secs))
+  const writeKBps = Math.round(((b.sectorsWritten - a.sectorsWritten) * 512) / (1024 * secs))
+  const iowait = Math.round(((b.msDoingIO - a.msDoingIO) / secs) * 100 / 1000) // % of time doing IO
+  return { readKBps, writeKBps, iowait }
+}
+
 async function main() {
   const ip = getLocalIp()
   console.log(`[update-storage] this server IP: ${ip}`)
@@ -27,6 +114,12 @@ async function main() {
 
   const storage = getDiskUsage(INGEST_DIR)
   console.log(`[update-storage] disk: total=${(storage.total / 1e9).toFixed(1)}GB used=${(storage.used / 1e9).toFixed(1)}GB free=${(storage.free / 1e9).toFixed(1)}GB`)
+
+  const cpu = getCpuUsage()
+  const ram = getRamUsage()
+  const diskIO = getDiskIO(INGEST_DIR)
+  const sysUsage = { cpu, ram, diskIO }
+  console.log(`[update-storage] sysUsage: cpu=${cpu}% ram=${ram}% diskIO=${diskIO.readKBps}KB/s read / ${diskIO.writeKBps}KB/s write / ${diskIO.iowait}% iowait`)
 
   const client = new pg.Client({ connectionString: DATABASE_URL })
   await client.connect()
@@ -43,8 +136,8 @@ async function main() {
   console.log(`[update-storage] updating Server ${serverId}`)
 
   await client.query(
-    'UPDATE "Server" SET storage = $1, "updatedAt" = NOW() WHERE id = $2',
-    [JSON.stringify(storage), serverId]
+    'UPDATE "Server" SET storage = $1, "sysUsage" = $2, "updatedAt" = NOW() WHERE id = $3',
+    [JSON.stringify(storage), JSON.stringify(sysUsage), serverId]
   )
 
   console.log("[update-storage] done")

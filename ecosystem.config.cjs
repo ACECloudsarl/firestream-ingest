@@ -23,8 +23,8 @@ module.exports = {
       script: 'scripts/update-storage.js',
       cwd: __dirname,
       autorestart: false,
-      // Run every 5 minutes
-      cron_restart: '*/5 * * * *',
+      // Run every 60 seconds
+      cron_restart: '* * * * *',
       restart_delay: 5000,
       env: {
         NODE_ENV: 'production'
