@@ -4,7 +4,7 @@ import path from 'node:path'
 import { INGEST_DIR, MISC_DIR, PORT, isAllowed } from './config.js'
 
 // Allowed file extensions for ingest
-const ALLOWED_EXTENSIONS = new Set(['.ts', '.m3u8', '.jpg', '.png', '.vtt'])
+const ALLOWED_EXTENSIONS = new Set(['.ts', '.m3u8', '.jpg', '.png', '.vtt', '.mp4'])
 
 // Request timeout (120s) — only triggers on stalled transfers
 const REQUEST_TIMEOUT_MS = 120_000
