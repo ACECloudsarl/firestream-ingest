@@ -107,6 +107,60 @@ function getDiskIO(mountPath) {
   return { readKBps, writeKBps, iowait }
 }
 
+function getPrimaryInterface() {
+  // Use default route to find the primary external interface
+  try {
+    const raw = execSync('ip route show default 0.0.0.0/0', { encoding: 'utf8' }).trim()
+    const m = raw.match(/dev\s+(\S+)/)
+    if (m) return m[1]
+  } catch { /* fall through */ }
+  // Fallback: first non-lo interface from /proc/net/dev
+  try {
+    const netDev = readFileSync('/proc/net/dev', 'utf8')
+    for (const line of netDev.split('\n')) {
+      const parts = line.trim().split(/\s+/)
+      const name = (parts[0] || '').replace(':', '')
+      if (name && name !== 'lo' && !name.startsWith('Inter')) return name
+    }
+  } catch { /* fall through */ }
+  return null
+}
+
+function readNetDev(iface) {
+  const raw = readFileSync('/proc/net/dev', 'utf8')
+  for (const line of raw.split('\n')) {
+    const parts = line.trim().split(/\s+/)
+    if (parts[0] === iface + ':') {
+      // fields: face rxBytes rxPkts rxErrs rxDrop ... txBytes txPkts txErrs ...
+      const rxBytes = parseInt(parts[1], 10) || 0
+      const txBytes = parseInt(parts[9], 10) || 0
+      return { rxBytes, txBytes }
+    }
+  }
+  return null
+}
+
+function getNetworkSpeed() {
+  const iface = getPrimaryInterface()
+  if (!iface) return { inSpeed: 0, outSpeed: 0 }
+
+  const a = readNetDev(iface)
+  if (!a) return { inSpeed: 0, outSpeed: 0 }
+
+  execSync('sleep 0.5')
+
+  const b = readNetDev(iface)
+  if (!b) return { inSpeed: 0, outSpeed: 0 }
+
+  const secs = 0.5
+  const rxDelta = b.rxBytes - a.rxBytes
+  const txDelta = b.txBytes - a.txBytes
+  // Clamp negative deltas (counter reset / interface restart) to 0
+  const inSpeed = Math.max(0, Math.round(rxDelta / secs))
+  const outSpeed = Math.max(0, Math.round(txDelta / secs))
+  return { inSpeed, outSpeed }
+}
+
 async function main() {
   const ip = getLocalIp()
   console.log(`[update-storage] this server IP: ${ip}`)
@@ -118,8 +172,9 @@ async function main() {
   const cpu = getCpuUsage()
   const ram = getRamUsage()
   const diskIO = getDiskIO(INGEST_DIR)
-  const sysUsage = { cpu, ram, diskIO }
-  console.log(`[update-storage] sysUsage: cpu=${cpu}% ram=${ram}% diskIO=${diskIO.readKBps}KB/s read / ${diskIO.writeKBps}KB/s write / ${diskIO.iowait}% iowait`)
+  const network = getNetworkSpeed()
+  const sysUsage = { cpu, ram, diskIO, network }
+  console.log(`[update-storage] sysUsage: cpu=${cpu}% ram=${ram}% diskIO=${diskIO.readKBps}KB/s read / ${diskIO.writeKBps}KB/s write / ${diskIO.iowait}% iowait | net: in=${(network.inSpeed / 1e6).toFixed(1)}MB/s out=${(network.outSpeed / 1e6).toFixed(1)}MB/s`)
 
   const client = new pg.Client({ connectionString: DATABASE_URL })
   await client.connect()
