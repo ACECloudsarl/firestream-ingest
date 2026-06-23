@@ -33,6 +33,21 @@ module.exports = {
       error_file: '/var/log/firestream-dav/storage-error.log',
       out_file: '/var/log/firestream-dav/storage-out.log',
       merge_logs: true
+    },
+    {
+      name: 'mini-poster',
+      script: 'scripts/mini-poster-server.js',
+      cwd: __dirname,
+      autorestart: true,
+      max_memory_restart: '512M',
+      env: {
+        NODE_ENV: 'production',
+        MINI_POSTER_PORT: '3000'
+      },
+      log_date_format: 'YYYY-MM-DD HH:mm:ss',
+      error_file: '/var/log/firestream-dav/mini-poster-error.log',
+      out_file: '/var/log/firestream-dav/mini-poster-out.log',
+      merge_logs: true
     }
   ]
 }
