@@ -140,7 +140,15 @@ function readNetDev(iface) {
   return null
 }
 
-function getNetworkSpeed() {
+// Read current cumulative counters once (no sleep) — used for the delta method
+function getCurrentNetCounters() {
+  const iface = getPrimaryInterface()
+  if (!iface) return null
+  return readNetDev(iface)
+}
+
+// 500ms snapshot — used only as fallback on first run or after counter reset
+function getNetworkSpeedSnapshot() {
   const iface = getPrimaryInterface()
   if (!iface) return { inSpeed: 0, outSpeed: 0 }
 
@@ -161,6 +169,17 @@ function getNetworkSpeed() {
   return { inSpeed, outSpeed }
 }
 
+// Compute network speed from cumulative counter delta since last DB write.
+// This captures 100% of bytes transferred — not just a 500ms window.
+function computeNetworkFromDelta(currentRx, currentTx, prevRx, prevTx, elapsedSec) {
+  if (elapsedSec <= 0) return null
+  // Counter reset or interface restart detected — can't use delta
+  if (currentRx < prevRx || currentTx < prevTx) return null
+  const inSpeed = Math.round((currentRx - prevRx) / elapsedSec)
+  const outSpeed = Math.round((currentTx - prevTx) / elapsedSec)
+  return { inSpeed, outSpeed }
+}
+
 async function main() {
   const ip = getLocalIp()
   console.log(`[update-storage] this server IP: ${ip}`)
@@ -172,15 +191,18 @@ async function main() {
   const cpu = getCpuUsage()
   const ram = getRamUsage()
   const diskIO = getDiskIO(INGEST_DIR)
-  const network = getNetworkSpeed()
-  const sysUsage = { cpu, ram, diskIO, network }
-  console.log(`[update-storage] sysUsage: cpu=${cpu}% ram=${ram}% diskIO=${diskIO.readKBps}KB/s read / ${diskIO.writeKBps}KB/s write / ${diskIO.iowait}% iowait | net: in=${(network.inSpeed / 1e6).toFixed(1)}MB/s out=${(network.outSpeed / 1e6).toFixed(1)}MB/s`)
+
+  // Read current /proc/net/dev counters once (no sleep)
+  const netCounters = getCurrentNetCounters()
 
   const client = new pg.Client({ connectionString: DATABASE_URL })
   await client.connect()
 
-  // Find server by IP
-  const row = await client.query('SELECT id FROM "Server" WHERE ip = $1', [ip])
+  // Find server by IP AND fetch previous network counters for delta calc
+  const row = await client.query(
+    'SELECT id, "sysUsage" FROM "Server" WHERE ip = $1',
+    [ip]
+  )
   if (row.rows.length === 0) {
     console.log(`[update-storage] no Server row found for IP ${ip}`)
     await client.end()
@@ -188,6 +210,49 @@ async function main() {
   }
 
   const serverId = row.rows[0].id
+  const prevSysUsage = row.rows[0].sysUsage || {}
+  const prevNetwork = prevSysUsage.network || {}
+  const prevRx = prevNetwork.lastRxBytes
+  const prevTx = prevNetwork.lastTxBytes
+  const prevTs = prevNetwork.lastTimestamp  // epoch ms, timezone-safe
+
+  // Compute network speed: prefer cumulative delta (100% accurate), fall back to 500ms snapshot
+  let network = { inSpeed: 0, outSpeed: 0, lastRxBytes: 0, lastTxBytes: 0, lastTimestamp: Date.now() }
+
+  if (netCounters) {
+    // Always seed the counters for next run
+    network.lastRxBytes = netCounters.rxBytes
+    network.lastTxBytes = netCounters.txBytes
+
+    if (prevRx != null && prevTx != null && prevTs != null) {
+      const elapsedSec = (Date.now() - prevTs) / 1000
+      const delta = computeNetworkFromDelta(
+        netCounters.rxBytes, netCounters.txBytes,
+        prevRx, prevTx, elapsedSec
+      )
+      if (delta) {
+        network.inSpeed = delta.inSpeed
+        network.outSpeed = delta.outSpeed
+        console.log(`[update-storage] net delta: elapsed=${elapsedSec.toFixed(0)}s deltaRx=${(netCounters.rxBytes - prevRx)}B deltaTx=${(netCounters.txBytes - prevTx)}B`)
+      } else {
+        // Counter reset detected — fall back to snapshot, counters already seeded above
+        console.log(`[update-storage] net counter reset detected, using fallback snapshot`)
+        const snap = getNetworkSpeedSnapshot()
+        network.inSpeed = snap.inSpeed
+        network.outSpeed = snap.outSpeed
+      }
+    } else {
+      // First run — no previous counters, use snapshot to get an initial reading
+      console.log(`[update-storage] net first run, using snapshot and seeding counters`)
+      const snap = getNetworkSpeedSnapshot()
+      network.inSpeed = snap.inSpeed
+      network.outSpeed = snap.outSpeed
+    }
+  }
+
+  const sysUsage = { cpu, ram, diskIO, network }
+  console.log(`[update-storage] sysUsage: cpu=${cpu}% ram=${ram}% diskIO=${diskIO.readKBps}KB/s read / ${diskIO.writeKBps}KB/s write / ${diskIO.iowait}% iowait | net: in=${(network.inSpeed / 1e6).toFixed(2)}MB/s out=${(network.outSpeed / 1e6).toFixed(2)}MB/s`)
+
   console.log(`[update-storage] updating Server ${serverId}`)
 
   await client.query(
