@@ -7,7 +7,7 @@ import { INGEST_DIR, MISC_DIR, PORT, isAllowed } from './config.js'
 const ALLOWED_EXTENSIONS = new Set(['.ts', '.m3u8', '.jpg', '.png', '.vtt', '.mp4'])
 
 // Request timeout (120s) — only triggers on stalled transfers
-const REQUEST_TIMEOUT_MS = 300_000 // 5 minutes
+const REQUEST_TIMEOUT_MS = 900_000 // 15 minutes
 
 // Stale .tmp cleanup interval (60s)
 const TMP_CLEANUP_INTERVAL_MS = 60_000
