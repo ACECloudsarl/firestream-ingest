@@ -206,6 +206,9 @@ const server = http.createServer((req, res) => {
   atomicWrite(filePath, req, res)
 })
 
+// Disable Node's built-in request timeout — we handle it ourselves via REQUEST_TIMEOUT_MS
+server.requestTimeout = 0
+
 // Graceful shutdown
 let shuttingDown = false
 
