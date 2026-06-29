@@ -35,6 +35,21 @@ module.exports = {
       merge_logs: true
     },
     {
+      name: 'poster-upload',
+      script: 'scripts/poster-upload-server.js',
+      cwd: __dirname,
+      autorestart: true,
+      max_memory_restart: '256M',
+      env: {
+        NODE_ENV: 'production',
+        POSTER_UPLOAD_PORT: '3001'
+      },
+      log_date_format: 'YYYY-MM-DD HH:mm:ss',
+      error_file: '/var/log/firestream-dav/poster-upload-error.log',
+      out_file: '/var/log/firestream-dav/poster-upload-out.log',
+      merge_logs: true
+    },
+    {
       name: 'mini-poster',
       script: 'scripts/mini-poster-server.js',
       cwd: __dirname,

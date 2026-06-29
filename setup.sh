@@ -14,7 +14,7 @@ echo "=== FireStream Ingest Setup ==="
 # ── 1. System dependencies ──────────────────────────────────────────
 echo "[1/8] Installing system packages..."
 apt-get update
-apt-get install -y nginx certbot curl
+apt-get install -y nginx certbot curl ffmpeg
 
 # ── 2. NVM + Node.js ───────────────────────────────────────────────
 echo "[2/8] Installing NVM and Node.js..."

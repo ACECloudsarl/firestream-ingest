@@ -8,6 +8,7 @@
     "start": "node ingest.js"
   },
   "dependencies": {
+    "busboy": "^1.6.0",
     "pg": "^8.21.0"
   }
 }
