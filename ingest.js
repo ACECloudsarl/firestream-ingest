@@ -1,7 +1,23 @@
 import http from 'node:http'
 import fs from 'node:fs'
 import path from 'node:path'
+import pg from 'pg'
 import { INGEST_DIR, MISC_DIR, PORT, isAllowed } from './config.js'
+
+const DATABASE_URL = process.env.DATABASE_URL || 'postgresql://firestream:SiMoX1234%40%40@204.168.236.110:5432/openvibe'
+
+// Lazy DB pool for progress updates
+let pool = null
+function getPool() {
+  if (!pool) {
+    pool = new pg.Pool({
+      connectionString: DATABASE_URL,
+      max: 5,
+      idleTimeoutMillis: 30_000,
+    })
+  }
+  return pool
+}
 
 // Allowed file extensions for ingest
 const ALLOWED_EXTENSIONS = new Set(['.ts', '.m3u8', '.jpg', '.png', '.vtt', '.mp4'])
@@ -74,8 +90,39 @@ function atomicWrite(filePath, req, res) {
     let bytes = 0
     let finished = false
 
-    // Track bytes from request
-    req.on('data', (chunk) => { bytes += chunk.length })
+    // Extract videoId for DB progress updates (ingest paths only)
+    const videoId = filePath.startsWith(INGEST_DIR)
+      ? path.basename(path.dirname(filePath))
+      : null
+
+    // Track bytes and log transfer progress
+    const total = parseInt(req.headers['content-length'], 10)
+    let lastLog = 0
+    req.on('data', (chunk) => {
+      bytes += chunk.length
+      const now = Date.now()
+      // Log progress and update DB every 3 seconds
+      if (now - lastLog > 3000) {
+        lastLog = now
+        const rel = path.relative(INGEST_DIR, filePath)
+        const pct = total ? Math.round((bytes / total) * 100) : null
+        if (total) {
+          log(`PROGRESS ${rel} ${formatBytes(bytes)}/${formatBytes(total)} (${pct}%)`)
+        } else {
+          log(`PROGRESS ${rel} ${formatBytes(bytes)} (unknown total)`)
+        }
+
+        // Update encodingProgress in DB for ingest files (not misc)
+        if (videoId && pct != null) {
+          getPool().query(
+            'UPDATE "Video" SET "encodingProgress" = $1, "updatedAt" = NOW() WHERE id = $2',
+            [pct, videoId]
+          ).catch(err => {
+            // Silently ignore DB errors — don't break the transfer
+          })
+        }
+      }
+    })
 
     // Pipe request body to file
     req.pipe(ws)
