@@ -355,7 +355,8 @@ async function transferVideo(video) {
 
   // Track progress: poll file sizes every 3s and update DB
   let progressInterval = null
-  let lastProgressPct = 0
+  let lastProgressPct = -1
+  let lastBytes = 0
 
   const startProgressPolling = () => {
     progressInterval = setInterval(() => {
@@ -363,20 +364,25 @@ async function transferVideo(video) {
       const currentBytes = getDirFileSizes(dirs)
       const expectedBytes = encodedSize ? parseInt(encodedSize) : 0
 
+      // Only update if data actually arrived since last tick
+      if (currentBytes === lastBytes) return
+      lastBytes = currentBytes
+
       let pct = 0
       if (expectedBytes > 0) {
         pct = Math.min(99, Math.round((currentBytes / expectedBytes) * 100))
       }
 
+      // Log and update DB whenever bytes change (keeps updatedAt alive)
       if (pct !== lastProgressPct) {
         lastProgressPct = pct
-        log(`[${label}] Progress ${formatBytes(currentBytes)}${expectedBytes ? ` / ~${formatBytes(expectedBytes)}` : ''} (${pct}%)`)
-
-        getPool().query(
-          'UPDATE "Video" SET "encodingProgress" = $1, "updatedAt" = NOW() WHERE id = $2',
-          [pct, videoId]
-        ).catch(() => { /* silent */ })
       }
+      log(`[${label}] Progress ${formatBytes(currentBytes)}${expectedBytes ? ` / ~${formatBytes(expectedBytes)}` : ''} (${pct}%)`)
+
+      getPool().query(
+        'UPDATE "Video" SET "encodingProgress" = $1, "updatedAt" = NOW() WHERE id = $2',
+        [pct, videoId]
+      ).catch(() => { /* silent */ })
     }, PROGRESS_INTERVAL_MS)
   }
 
