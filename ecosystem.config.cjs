@@ -19,6 +19,22 @@ module.exports = {
       merge_logs: true
     },
     {
+      name: 'firestream-transfers',
+      script: 'transfers.js',
+      cwd: __dirname,
+      autorestart: true,
+      max_memory_restart: '512M',
+      env: {
+        NODE_ENV: 'production'
+      },
+      // Graceful shutdown — let in-flight downloads drain (max 5 min)
+      kill_timeout: 300000,
+      log_date_format: 'YYYY-MM-DD HH:mm:ss',
+      error_file: '/var/log/firestream-dav/transfers-error.log',
+      out_file: '/var/log/firestream-dav/transfers-out.log',
+      merge_logs: true
+    },
+    {
       name: 'firestream-storage',
       script: 'scripts/update-storage.js',
       cwd: __dirname,

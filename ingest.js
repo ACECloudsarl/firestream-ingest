@@ -236,12 +236,23 @@ const server = http.createServer((req, res) => {
     return res.end()
   }
 
+  // Extract videoId from URL for timeout-error DB updates
+  // URL format: /{userId}/{videoId}/{filename}
+  const urlParts = req.url.split('/').filter(Boolean)
+  const videoId = (urlParts[0] !== 'misc' && urlParts.length >= 2) ? urlParts[1] : null
+
   // Track for graceful shutdown
   activeRequests++
 
   // Request timeout — stall detection
   const timer = setTimeout(() => {
     log(`TIMEOUT PUT ${req.url} (${REQUEST_TIMEOUT_MS}ms)`)
+    if (videoId) {
+      getPool().query(
+        'UPDATE "Video" SET "transferStatus" = $1, "updatedAt" = NOW() WHERE id = $2',
+        ['error', videoId]
+      ).catch(err => log(`DB ERROR timeout update for ${videoId}: ${err.message}`))
+    }
     req.destroy()
   }, REQUEST_TIMEOUT_MS)
 
