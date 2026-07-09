@@ -12,6 +12,24 @@ cp .env.example .env
 pm2 start ecosystem.config.js
 ```
 
+## Additional services
+
+| Service | Port | Description |
+|---------|------|-------------|
+| `mini-poster-server.js` | 3000 | Auto-generate 10 thumbnail frames from source video |
+| `poster-upload-server.js` | 3001 | Custom poster upload + grid-poster regeneration |
+| `subtitle-server.js` | 3002 | Subtitle upload (.vtt/.srt) with SRT→VTT conversion |
+
+### Subtitle upload
+
+```
+POST /upload_subtitle/{videoId}
+  FormData: file (.vtt or .srt), userId (or key for API key auth)
+  Returns: { "filename": "{uuid}.vtt" }
+```
+
+Subtitles are served from `misc/{userId}/subtitles/` with `Content-Type: text/vtt` and CORS headers for `<video>` text tracks.
+
 ## How it works
 
 Encoder servers push HLS output via ffmpeg's DAV protocol:

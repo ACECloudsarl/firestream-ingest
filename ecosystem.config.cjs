@@ -79,6 +79,21 @@ module.exports = {
       error_file: '/var/log/firestream-dav/mini-poster-error.log',
       out_file: '/var/log/firestream-dav/mini-poster-out.log',
       merge_logs: true
+    },
+    {
+      name: 'subtitle-server',
+      script: 'scripts/subtitle-server.js',
+      cwd: __dirname,
+      autorestart: true,
+      max_memory_restart: '256M',
+      env: {
+        NODE_ENV: 'production',
+        SUBTITLE_PORT: '3002'
+      },
+      log_date_format: 'YYYY-MM-DD HH:mm:ss',
+      error_file: '/var/log/firestream-dav/subtitle-error.log',
+      out_file: '/var/log/firestream-dav/subtitle-out.log',
+      merge_logs: true
     }
   ]
 }
