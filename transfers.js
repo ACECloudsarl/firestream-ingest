@@ -121,7 +121,7 @@ async function claimPendingVideos(limit) {
 }
 
 // ── Build asset URL list for a video ────────────────────────────────
-function buildAssetList(encoderUrl, videoId, userId) {
+async function buildAssetList(encoderUrl, videoId, userId) {
   const base = `${encoderUrl}/encodings/_tmp/${videoId}`
   const assets = []
 
@@ -172,6 +172,24 @@ function buildAssetList(encoderUrl, videoId, userId) {
     dir: path.join(INGEST_DIR, userId, videoId),
     out: `${videoId}.vtt`,
   })
+
+  // Subtitle VTT files — query DB for filenames
+  try {
+    const { rows } = await getPool().query(
+      `SELECT filename FROM subtitles WHERE "videoId" = $1 AND status = 'active'`,
+      [videoId]
+    )
+    for (const row of rows) {
+      assets.push({
+        url: `${encoderUrl}/misc/${userId}/subtitles/${row.filename}`,
+        dir: path.join(MISC_DIR, userId, 'subtitles'),
+        out: row.filename,
+      })
+    }
+  } catch (err) {
+    // Non-fatal — subtitles will be skipped if DB is unreachable
+    log(`[${videoId}] WARN failed to query subtitles: ${err.message}`)
+  }
 
   return assets
 }
@@ -342,8 +360,8 @@ async function transferVideo(video) {
     return
   }
 
-  // Build asset list and create input file
-  const assets = buildAssetList(encoderUrl, videoId, userId)
+  // Build asset list (includes DB query for subtitle files)
+  const assets = await buildAssetList(encoderUrl, videoId, userId)
   const tmpDir = path.join(INGEST_DIR, userId, videoId)
 
   // Ensure target directories exist
