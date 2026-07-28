@@ -121,7 +121,7 @@ async function claimPendingVideos(limit) {
 }
 
 // ── Build asset URL list for a video ────────────────────────────────
-async function buildAssetList(encoderUrl, videoId, userId) {
+async function buildAssetList(encoderUrl, videoId, userId, isMulti) {
   const base = `${encoderUrl}/encodings/_tmp/${videoId}`
   const assets = []
 
@@ -131,6 +131,15 @@ async function buildAssetList(encoderUrl, videoId, userId) {
     dir: path.join(INGEST_DIR, userId, videoId),
     out: 'video.mp4',
   })
+
+  // SD companion video (multi-bitrate)
+  if (isMulti) {
+    assets.push({
+      url: `${base}/video_sd.mp4`,
+      dir: path.join(INGEST_DIR, userId, videoId),
+      out: 'video_sd.mp4',
+    })
+  }
   assets.push({
     url: `${base}/video.m3u8`,
     dir: path.join(INGEST_DIR, userId, videoId),
@@ -361,7 +370,7 @@ async function transferVideo(video) {
   }
 
   // Build asset list (includes DB query for subtitle files)
-  const assets = await buildAssetList(encoderUrl, videoId, userId)
+  const assets = await buildAssetList(encoderUrl, videoId, userId, isMulti)
   const tmpDir = path.join(INGEST_DIR, userId, videoId)
 
   // Ensure target directories exist
