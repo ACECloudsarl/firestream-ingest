@@ -91,7 +91,7 @@ async function claimPendingVideos(limit) {
     await client.query('BEGIN')
     // Lock rows to prevent race conditions
     const { rows } = await client.query(
-      `SELECT id, "userId", "encoderId", "encodedSize"
+      `SELECT id, "userId", "encoderId", "encodedSize", "isMulti"
        FROM "Video"
        WHERE status = 'active'
          AND "encodingStatus" = 'completed'
@@ -345,9 +345,9 @@ function getDirFileSizes(dirs) {
 
 // ── Transfer one video ──────────────────────────────────────────────
 async function transferVideo(video) {
-  const { id: videoId, userId, encoderId, encodedSize } = video
+  const { id: videoId, userId, encoderId, encodedSize, isMulti } = video
   const label = `${videoId}`
-  log(`[${label}] Starting transfer (expected: ${encodedSize ? formatBytes(parseInt(encodedSize)) : 'unknown'})`)
+  log(`[${label}] Starting transfer (expected: ${encodedSize ? formatBytes(parseInt(encodedSize)) : 'unknown'})${isMulti ? ' [MULTI]' : ''}`)
 
   // Resolve encoder URL
   let encoderUrl
@@ -454,6 +454,19 @@ async function transferVideo(video) {
       await failTransfer(videoId, 'No video file downloaded (neither mp4 nor m3u8 found)')
       try { fs.unlinkSync(inputFile) } catch {}
       return
+    }
+
+    // ── SD video check (multi-bitrate) ────────────────────────────────
+    if (isMulti) {
+      const sdPath = path.join(INGEST_DIR, userId, videoId, 'video_sd.mp4')
+      if (!fs.existsSync(sdPath)) {
+        log(`[${label}] video_sd.mp4 missing for multi-bitrate video — failing`)
+        await failTransfer(videoId, 'video_sd.mp4 not found (multi-bitrate required)')
+        try { fs.unlinkSync(inputFile) } catch {}
+        return
+      }
+      const sdStat = fs.statSync(sdPath)
+      log(`[${label}] video_sd.mp4 verified (${formatBytes(sdStat.size)})`)
     }
 
     // Final progress = 100
