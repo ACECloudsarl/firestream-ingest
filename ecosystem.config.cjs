@@ -51,6 +51,23 @@ module.exports = {
       merge_logs: true
     },
     {
+      name: 'firestream-cleanup',
+      script: 'scripts/cleanup-videos.js',
+      args: '--execute --batch-size 25 --scheduled',
+      cwd: __dirname,
+      autorestart: false,
+      cron_restart: '0 0,12 * * *',
+      max_memory_restart: '512M',
+      env: {
+        NODE_ENV: 'production',
+        TZ: 'Europe/Berlin'
+      },
+      log_date_format: 'YYYY-MM-DD HH:mm:ss',
+      error_file: '/var/log/firestream-dav/cleanup-error.log',
+      out_file: '/var/log/firestream-dav/cleanup-out.log',
+      merge_logs: true
+    },
+    {
       name: 'poster-upload',
       script: 'scripts/poster-upload-server.js',
       cwd: __dirname,
