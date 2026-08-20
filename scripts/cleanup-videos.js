@@ -23,8 +23,8 @@ const DATABASE_URL = process.env.DATABASE_URL
 const DEFAULT_BATCH_SIZE = 100
 const DMCA_HOLD_SECONDS = 48 * 60 * 60
 const ADVISORY_LOCK_KEY = 1_947_323_821
-const INACTIVITY_STATUSES = new Set(['active', 'offline'])
-const TERMINAL_STATUSES = new Set(['removed', 'hard_deleted'])
+const INACTIVITY_STATUSES = new Set(['active'])
+const TERMINAL_STATUSES = new Set(['offline', 'removed', 'hard_deleted'])
 const TRASH_ROOT = process.env.TRASH_DIR || path.join(path.dirname(path.resolve(INGEST_DIR)), 'trash')
 const REDIS_URL = process.env.REDIS_URL || 'redis://127.0.0.1:6379'
 const REDIS_CACHE_TTL_SECONDS = 90 * 24 * 60 * 60
@@ -33,7 +33,7 @@ const REDIS_CACHE_VERSION = 'v1'
 function usage() {
   console.log(`Usage: node scripts/cleanup-videos.js [options]
 
-Tier-aware cleanup for inactive, removed, and hard-deleted videos.
+Tier-aware cleanup for inactive, offline, removed, and hard-deleted videos.
 Dry-run is the default. Execute mode moves unreferenced assets to recoverable
 trash and updates eligible database rows to hard_deleted.
 
@@ -165,6 +165,14 @@ function hasDmcaHold(video, dmcaAges) {
   if (!isDmca(video)) return false
   const timing = dmcaAges.get(video.id)
   return !timing || !Number.isFinite(timing.ageSeconds) || timing.ageSeconds < DMCA_HOLD_SECONDS
+}
+
+function hasColdArchiveProof(video) {
+  return video.coldStorage === true
+    && Boolean(video.coldStorageId)
+    && Boolean(video.coldStoragePath)
+    && Boolean(video.coldStorageChecksum)
+    && Number(video.coldStorageBytes) > 0
 }
 
 function assetDirectory(video) {
@@ -334,6 +342,8 @@ function moveDirectoryToTrash(video, sourceDir, trashRun, protectedIds) {
 const VIDEO_FIELDS = `
   v.id, v."userId", v.status, v.reason, v."updatedAt", v."createdAt", v."lastView",
   v."clonedFrom", v."encodedPath", v."encodedSize", v."storageId",
+  v."coldStorage", v."coldStorageId", v."coldStorageStatus", v."coldStoragePath",
+  v."coldStorageChecksum", v."coldStorageBytes",
   v."transferStatus", v."encodingStatus", v.slug, v.title, u.username,
   u."creatorTier", t.name AS "tierName",
   t."inactivityDays",
@@ -357,9 +367,9 @@ async function fetchCandidates(client, storageId, afterId, limit) {
      WHERE v."storageId" = $1
        AND v.id > $2
        AND (
-         v.status IN ('removed', 'hard_deleted')
+         v.status IN ('offline', 'removed', 'hard_deleted')
          OR (
-           v.status IN ('active', 'offline')
+           v.status = 'active'
            AND t.id IS NOT NULL
            AND t."inactivityDays" > 0
            AND COALESCE(v."lastView", v."createdAt") <= NOW() - make_interval(days => t."inactivityDays")
@@ -460,7 +470,7 @@ async function countInvalidTierVideos(client, storageId) {
      JOIN "User" u ON u.id = v."userId"
      LEFT JOIN user_tiers t ON lower(t.name) = lower(u."creatorTier")
      WHERE v."storageId" = $1
-       AND v.status IN ('active', 'offline')
+       AND v.status = 'active'
        AND (t.id IS NULL OR t."inactivityDays" <= 0)`,
     [storageId]
   )
@@ -479,6 +489,7 @@ function newSummary() {
     retained_shared: 0,
     eligible_existing: 0,
     eligible_missing_proven: 0,
+    eligible_cold_remote: 0,
     missing_unproven: 0,
     unsafe_path: 0,
     moved_to_trash: 0,
@@ -535,6 +546,9 @@ function dryRunDecision(video, group, dmcaAges, trashMoves) {
   const disk = inspectExactDirectory(dir)
   if (!disk.safe) return { action: 'unsafe_path', detail: disk.detail }
   if (!disk.exists) {
+    if (hasColdArchiveProof(video)) {
+      return { action: 'eligible_cold_remote', detail: 'verified cold-archive metadata; remote purge will follow terminal DB update' }
+    }
     return provenTrashRecord(dir, trashMoves)
       ? { action: 'eligible_missing_proven', detail: 'exact trash copy proven by manifest' }
       : { action: 'missing_unproven', detail: 'source missing without trash proof' }
@@ -596,7 +610,7 @@ async function updateEligibleRows(client, rows, storageId) {
   const { rows: updated } = await client.query(
     `UPDATE "Video"
      SET status = 'hard_deleted',
-         reason = CASE WHEN status IN ('active', 'offline') THEN 'inactivity' ELSE reason END,
+         reason = CASE WHEN status = 'active' THEN 'inactivity' ELSE reason END,
          "updatedAt" = NOW()
      WHERE id = ANY($1::text[])
        AND status IN ('active', 'offline', 'removed')
@@ -729,7 +743,7 @@ async function executeCandidate(client, candidate, storageId, trashRun, trashMov
         return { decision: moved, processedIds: [] }
       }
       trashMoves.set(sourceDir, { sourcePath: sourceDir, trashPath: moved.trashPath, manifestPath: trashRun.manifestPath })
-    } else if (!provenTrashRecord(sourceDir, trashMoves)) {
+    } else if (!provenTrashRecord(sourceDir, trashMoves) && !hasColdArchiveProof(current)) {
       await client.query('ROLLBACK')
       return { decision: { action: 'missing_unproven', detail: 'source missing without exact trash proof' }, processedIds: [] }
     }
@@ -753,7 +767,9 @@ async function executeCandidate(client, candidate, storageId, trashRun, trashMov
     }
     decision = moved
       ? { action: 'moved_to_trash', detail: `${sourceDir} -> ${moved.trashPath}` }
-      : { action: 'eligible_missing_proven', detail: 'DB reconciled from exact trash manifest' }
+      : hasColdArchiveProof(current)
+        ? { action: 'eligible_cold_remote', detail: 'DB updated; cold-storage worker will purge the remote copy' }
+        : { action: 'eligible_missing_proven', detail: 'DB reconciled from exact trash manifest' }
     const finalRows = applyStatusChanges(rowsToLog, changes)
     return {
       decision,

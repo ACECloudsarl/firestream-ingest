@@ -125,6 +125,23 @@ server {
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $scheme;
 
+        # The upload is initiated by the FireStream homepage. Set these at
+        # Nginx so CORS headers are also present on Nginx-generated errors
+        # (for example 413/502), not only on responses from Node.js.
+        proxy_hide_header Access-Control-Allow-Origin;
+        proxy_hide_header Access-Control-Allow-Methods;
+        proxy_hide_header Access-Control-Allow-Headers;
+        add_header Access-Control-Allow-Origin "https://firestream.to" always;
+        add_header Access-Control-Allow-Methods "POST, OPTIONS" always;
+        add_header Access-Control-Allow-Headers "Accept, Content-Type, Authorization, X-Requested-With" always;
+        add_header Access-Control-Max-Age "86400" always;
+
+        # Do not forward the browser's preflight request to the upload
+        # parser. Returning here also makes preflight work when Node is down.
+        if ($request_method = OPTIONS) {
+            return 204;
+        }
+
         proxy_connect_timeout 120s;
         proxy_send_timeout 120s;
         proxy_read_timeout 120s;

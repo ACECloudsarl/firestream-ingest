@@ -19,6 +19,36 @@ pm2 start ecosystem.config.js
 | `mini-poster-server.js` | 3000 | Auto-generate 10 thumbnail frames from source video |
 | `poster-upload-server.js` | 3001 | Custom poster upload + grid-poster regeneration |
 | `subtitle-server.js` | 3002 | Subtitle upload (.vtt/.srt) with SRT→VTT conversion |
+| `cold-storage-restore.js` | 3003 | Queue and monitor restoration of temporary cold videos |
+
+### Cold-storage restore API
+
+The restore API accepts requests only from IPs in `allowed_ips.json`. If the
+local storage server has a non-empty `Server.apiKey`, callers must also send it
+as `Authorization: Bearer <apiKey>`.
+
+```text
+POST /restore/{videoId}  -> 200 ready, or 202 queued
+GET  /restore/{videoId}  -> current byte and percentage progress
+GET  /health             -> service health
+```
+
+Example queued/status response:
+
+```json
+{
+  "videoId": "...",
+  "state": "restoring",
+  "ready": false,
+  "percent": 42,
+  "bytesTransferred": 120000000,
+  "totalBytes": 285000000,
+  "error": null
+}
+```
+
+The homepage should call `POST` before creating the Plyr source, poll `GET`
+every two seconds, and initialize/reload Plyr only when `ready` is `true`.
 
 ### Subtitle upload
 
