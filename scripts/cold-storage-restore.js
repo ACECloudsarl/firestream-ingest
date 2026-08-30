@@ -1,11 +1,13 @@
 import http from 'node:http'
 import { createHash, timingSafeEqual } from 'node:crypto'
 import {
+  cp,
   lstat,
   mkdir,
   opendir,
   realpath,
   rename,
+  rm,
   stat,
   statfs,
 } from 'node:fs/promises'
@@ -18,6 +20,7 @@ import { INGEST_DIR, isAllowed } from '../config.js'
 const DATABASE_URL = process.env.DATABASE_URL
 const REDIS_URL = process.env.REDIS_URL || 'redis://127.0.0.1:6379'
 const STAGING_ROOT = path.join(path.dirname(path.resolve(INGEST_DIR)), 'cold-restore')
+const COLD_STAGE_ROOT = process.env.COLD_STAGE_ROOT || '/cold-stage'
 const LOCAL_RESERVE_BYTES = 50_000_000_000
 const QUEUE_INTERVAL_MS = 2_000
 const PROGRESS_TTL_SECONDS = 7 * 24 * 60 * 60
@@ -236,6 +239,77 @@ async function exists(directory) {
   }
 }
 
+async function resolveColdStagePath(value) {
+  const root = await realpath(COLD_STAGE_ROOT)
+  const expected = path.resolve(String(value || ''))
+  if (expected === root || !expected.startsWith(`${root}${path.sep}`)) throw new Error('cold stage path escapes staging root')
+  const actual = await realpath(expected)
+  if (actual !== expected || !actual.startsWith(`${root}${path.sep}`)) throw new Error('cold stage path is a symlink or escapes staging root')
+  const info = await lstat(actual)
+  if (!info.isDirectory() || info.isSymbolicLink()) throw new Error('cold stage path is not a safe directory')
+  return actual
+}
+
+async function resetStagedRestore(client, video, error) {
+  const message = String(error.message || error).slice(0, 2000)
+  await client.query('BEGIN')
+  try {
+    await client.query(
+      `UPDATE cold_storage_staging
+       SET status = 'ready', error = $2, "retryAt" = NULL, "updatedAt" = NOW()
+       WHERE "videoId" = $1`,
+      [video.id, message]
+    )
+    await client.query(
+      `UPDATE "Video"
+       SET "coldStorage" = true, "coldStorageStatus" = 'staged',
+           "coldStorageId" = NULL, "coldStoragePath" = $2,
+           "coldStorageChecksum" = $3, "coldStorageBytes" = $4,
+           "coldStorageUpdatedAt" = NOW(), "coldStorageError" = $5
+       WHERE id = $1`,
+      [video.id, video.stagePath, video.stageChecksum, Number(video.stageBytes), message]
+    )
+    await client.query('COMMIT')
+    await setProgress(video.id, { state: 'failed', error: message, updatedAt: new Date().toISOString() })
+  } catch (resetError) {
+    await client.query('ROLLBACK').catch(() => {})
+    throw resetError
+  }
+}
+
+async function markStagedLocal(client, video) {
+  await client.query('BEGIN')
+  try {
+    const locked = await client.query(
+      `SELECT v.status, v."coldStorageStatus", s.status AS "stageStatus"
+       FROM "Video" v JOIN cold_storage_staging s ON s."videoId" = v.id
+       WHERE v.id = $1 FOR UPDATE OF v, s`,
+      [video.id]
+    )
+    const current = locked.rows[0]
+    if (!current || current.status !== 'active' || current.coldStorageStatus !== 'restoring' || current.stageStatus !== 'restoring') {
+      throw new Error('staged video changed while completing local restore')
+    }
+    await client.query(
+      `UPDATE "Video"
+       SET "coldStorage" = false, "coldStorageStatus" = 'local',
+           "coldStorageId" = NULL, "coldStoragePath" = NULL,
+           "coldStorageChecksum" = NULL, "coldStorageBytes" = NULL,
+           "archivedAt" = NULL, "restoreRequestedAt" = NULL,
+           "coldStorageUpdatedAt" = NOW(), "coldStorageRetryAt" = NULL,
+           "coldStorageError" = NULL
+       WHERE id = $1`,
+      [video.id]
+    )
+    await client.query(`DELETE FROM cold_storage_staging WHERE "videoId" = $1`, [video.id])
+    await client.query('COMMIT')
+    await setProgress(video.id, { state: 'ready', percent: 100, error: '', updatedAt: new Date().toISOString() })
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => {})
+    throw error
+  }
+}
+
 async function connectRedis() {
   const client = createRedisClient({ url: REDIS_URL, socket: { connectTimeout: 1_500, reconnectStrategy: false } })
   client.on('error', () => {})
@@ -400,7 +474,7 @@ async function markLocal(client, video, box) {
       [video.id]
     )
     const current = locked.rows[0]
-    if (!current || !['active', 'offline'].includes(current.status) || !current.coldStorage) {
+    if (!current || current.status !== 'active' || !current.coldStorage) {
       throw new Error('video became unavailable while completing restore')
     }
     await removeRemoteArchive(box, video.coldStoragePath)
@@ -435,6 +509,75 @@ async function markLocal(client, video, box) {
   } catch (error) {
     await client.query('ROLLBACK').catch(() => {})
     throw error
+  }
+}
+
+async function restoreStagedVideo(pool, video) {
+  const client = await pool.connect()
+  let videoLock = false
+  const restoreDirectory = path.join(STAGING_ROOT, assertSafeComponent(video.id, 'video ID'))
+  try {
+    const lock = await client.query(
+      `SELECT pg_try_advisory_lock(hashtext('cold-storage-restore'), hashtext($1)) AS acquired`,
+      [video.id]
+    )
+    if (!lock.rows[0].acquired) return
+    videoLock = true
+    const source = await resolveColdStagePath(video.stagePath)
+    const sourceInspection = await inspectAndHashDirectory(source)
+    if (sourceInspection.totalBytes !== Number(video.stageBytes) || sourceInspection.files !== Number(video.stageFiles)) {
+      throw new Error('staged restore source no longer matches its verified byte/file manifest')
+    }
+    const destination = assetDirectory(video)
+    if (await exists(destination)) {
+      const current = await inspectAndHashDirectory(destination)
+      if (current.totalBytes !== sourceInspection.totalBytes || current.files !== sourceInspection.files || current.checksum !== sourceInspection.checksum) {
+        throw new Error('existing local destination differs from staged source')
+      }
+      await markStagedLocal(client, video)
+      await rm(source, { recursive: true, force: true, maxRetries: 3, retryDelay: 1000 }).catch(() => {})
+      log(`${video.id}: verified existing local copy and released staging copy`)
+      return
+    }
+
+    const filesystem = await statfs(INGEST_DIR, { bigint: true })
+    const available = Number(filesystem.bfree * filesystem.bsize)
+    const required = Number(video.stageBytes) + LOCAL_RESERVE_BYTES
+    if (available < required) throw new Error(`insufficient local space: need ${required} bytes including reserve, have ${available}`)
+    if (await exists(restoreDirectory)) throw new Error('local restore staging directory already exists')
+
+    await setProgress(video.id, {
+      state: 'restoring', bytesTransferred: 0, totalBytes: video.stageBytes,
+      percent: 0, speedBytesPerSecond: 0, speed: '0 B/s', error: '',
+      updatedAt: new Date().toISOString(),
+    })
+    const startedAt = Date.now()
+    await cp(source, restoreDirectory, {
+      recursive: true, force: false, errorOnExist: true, preserveTimestamps: true,
+    })
+    const restored = await inspectAndHashDirectory(restoreDirectory)
+    if (restored.totalBytes !== sourceInspection.totalBytes || restored.files !== sourceInspection.files || restored.checksum !== sourceInspection.checksum) {
+      throw new Error('local restore copy does not match staged source')
+    }
+    await mkdir(path.dirname(destination), { recursive: true, mode: 0o755 })
+    if (await exists(destination)) throw new Error('local destination appeared during staged restore')
+    await rename(restoreDirectory, destination)
+    await markStagedLocal(client, video)
+    await rm(source, { recursive: true, force: true, maxRetries: 3, retryDelay: 1000 }).catch(() => {})
+    const elapsedMs = Math.max(Date.now() - startedAt, 1)
+    log(`${video.id}: restored ${formatBytes(restored.totalBytes)} from local staging in ${formatDuration(elapsedMs)}; average ${formatRate(restored.totalBytes / (elapsedMs / 1000))}`)
+  } catch (error) {
+    await rm(restoreDirectory, { recursive: true, force: true, maxRetries: 3, retryDelay: 1000 }).catch(() => {})
+    await resetStagedRestore(client, video, error).catch(() => {})
+    log(`${video.id}: staged restore ERROR ${error.message}`)
+  } finally {
+    if (videoLock) {
+      await client.query(
+        `SELECT pg_advisory_unlock(hashtext('cold-storage-restore'), hashtext($1))`,
+        [video.id]
+      ).catch(() => {})
+    }
+    client.release()
   }
 }
 
@@ -506,13 +649,17 @@ async function restoreVideo(pool, video) {
 async function claimQueuedRestores(client, storageId, limit) {
   const { rows } = await client.query(
     `SELECT v.id, v."userId", v."encodedPath", v."coldStorageId",
-            v."coldStoragePath", v."coldStorageChecksum", v."coldStorageBytes"
+            v."coldStoragePath", v."coldStorageChecksum", v."coldStorageBytes",
+            s."stagePath", s.bytes AS "stageBytes", s.files AS "stageFiles",
+            s.checksum AS "stageChecksum"
      FROM "Video" v
+     LEFT JOIN cold_storage_staging s ON s."videoId" = v.id
      WHERE v."storageId" = $1
-       AND v.status IN ('active', 'offline')
+       AND v.status = 'active'
        AND v."coldStorage"
        AND v."coldStorageStatus" = 'restoring'
        AND v."restoreRequestedAt" IS NOT NULL
+       AND (s.status = 'restoring' OR (s."videoId" IS NULL AND v."coldStorageId" IS NOT NULL))
      ORDER BY v."restoreRequestedAt", v.id
      LIMIT $2`,
     [storageId, limit]
@@ -530,7 +677,8 @@ async function restoreLoop(pool, storageId, concurrency) {
         client.release()
         for (const video of queued) {
           if ([...running].some(item => item.videoId === video.id)) continue
-          const promise = restoreVideo(pool, video).finally(() => running.delete(wrapper))
+          const promise = (video.stagePath ? restoreStagedVideo(pool, video) : restoreVideo(pool, video))
+            .finally(() => running.delete(wrapper))
           const wrapper = { videoId: video.id, promise }
           running.add(wrapper)
         }
@@ -580,9 +728,51 @@ async function requestRestore(pool, storageId, videoId) {
       await client.query('ROLLBACK')
       return { status: 404, body: { error: 'video_not_found' } }
     }
-    if (!['active', 'offline'].includes(video.status)) {
+    if (video.status !== 'active') {
       await client.query('ROLLBACK')
       return { status: 410, body: { error: 'video_unavailable' } }
+    }
+    const staged = await client.query(
+      `SELECT "stagePath", bytes, files, checksum, status
+       FROM cold_storage_staging WHERE "videoId" = $1 FOR UPDATE`,
+      [videoId]
+    )
+    const stage = staged.rows[0]
+    if (stage?.status === 'copying') {
+      await client.query(`UPDATE "Video" SET "lastView" = NOW(), "updatedAt" = NOW() WHERE id = $1`, [videoId])
+      await client.query('COMMIT')
+      return {
+        status: 200,
+        body: { videoId, state: 'ready', ready: true, percent: 100, speedBytesPerSecond: 0, speed: '0 B/s' },
+      }
+    }
+    if (stage) {
+      const stageStatus = stage.status === 'uploading' ? 'uploading' : 'restoring'
+      if (stage.status !== 'uploading') {
+        await client.query(
+          `UPDATE cold_storage_staging SET status = 'restoring', error = NULL, "retryAt" = NULL, "updatedAt" = NOW()
+           WHERE "videoId" = $1`,
+          [videoId]
+        )
+      }
+      await client.query(
+        `UPDATE "Video"
+         SET "coldStorageStatus" = $2, "restoreRequestedAt" = COALESCE("restoreRequestedAt", NOW()),
+             "coldStorageUpdatedAt" = NOW(), "coldStorageError" = NULL, "lastView" = NOW()
+         WHERE id = $1`,
+        [videoId, stageStatus === 'uploading' ? 'archiving' : 'restoring']
+      )
+      await client.query('COMMIT')
+      await setProgress(videoId, {
+        state: stageStatus, bytesTransferred: 0, totalBytes: stage.bytes,
+        percent: 0, speedBytesPerSecond: 0, speed: '0 B/s', error: '',
+        updatedAt: new Date().toISOString(),
+      })
+      return {
+        status: 202,
+        body: { videoId, state: stageStatus, ready: false, percent: 0, speedBytesPerSecond: 0, speed: '0 B/s' },
+        headers: { 'Retry-After': '2' },
+      }
     }
     if (!video.coldStorage) {
       await client.query(

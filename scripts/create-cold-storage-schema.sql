@@ -18,6 +18,8 @@ CREATE TABLE IF NOT EXISTS storage_boxes (
   "basePath" text NOT NULL DEFAULT 'firestream/cold-videos',
   "capacityBytes" bigint NOT NULL,
   "usedBytes" bigint NOT NULL DEFAULT 0,
+  "minimumFreeBytes" bigint NOT NULL DEFAULT 100000000000,
+  "acceptingUploads" boolean NOT NULL DEFAULT true,
   "maxConnections" integer NOT NULL DEFAULT 10,
   priority integer NOT NULL DEFAULT 100,
   "inactivityDays" integer NOT NULL DEFAULT 15,
@@ -31,6 +33,7 @@ CREATE TABLE IF NOT EXISTS storage_boxes (
   CONSTRAINT storage_boxes_ssh_port_check CHECK ("sshPort" BETWEEN 1 AND 65535),
   CONSTRAINT storage_boxes_capacity_check CHECK ("capacityBytes" > 0),
   CONSTRAINT storage_boxes_used_bytes_check CHECK ("usedBytes" >= 0),
+  CONSTRAINT storage_boxes_minimum_free_check CHECK ("minimumFreeBytes" >= 0),
   CONSTRAINT storage_boxes_max_connections_check CHECK ("maxConnections" > 0),
   CONSTRAINT storage_boxes_priority_check CHECK (priority >= 0),
   CONSTRAINT storage_boxes_inactivity_days_check CHECK ("inactivityDays" > 0),
@@ -47,6 +50,8 @@ CREATE TABLE IF NOT EXISTS storage_boxes (
 ALTER TABLE storage_boxes
   ADD COLUMN IF NOT EXISTS "sshKeyPath" text,
   ADD COLUMN IF NOT EXISTS "knownHostsPath" text NOT NULL DEFAULT '/root/.ssh/known_hosts',
+  ADD COLUMN IF NOT EXISTS "minimumFreeBytes" bigint NOT NULL DEFAULT 100000000000,
+  ADD COLUMN IF NOT EXISTS "acceptingUploads" boolean NOT NULL DEFAULT true,
   ADD COLUMN IF NOT EXISTS priority integer NOT NULL DEFAULT 100,
   ADD COLUMN IF NOT EXISTS "inactivityDays" integer NOT NULL DEFAULT 15,
   ADD COLUMN IF NOT EXISTS "maxUsagePercent" numeric(5,2) NOT NULL DEFAULT 99,
@@ -76,13 +81,16 @@ ALTER TABLE "Server"
 ALTER TABLE "Video" DROP CONSTRAINT IF EXISTS "Video_coldStorageStatus_check";
 ALTER TABLE "Video"
   ADD CONSTRAINT "Video_coldStorageStatus_check"
-  CHECK ("coldStorageStatus" IN ('local', 'archiving', 'cold', 'restoring', 'purging', 'failed'))
+  CHECK ("coldStorageStatus" IN ('local', 'staged', 'archiving', 'cold', 'restoring', 'purging', 'failed'))
   NOT VALID;
 
 DO $$
 BEGIN
   IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid = 'storage_boxes'::regclass AND conname = 'storage_boxes_priority_check') THEN
     ALTER TABLE storage_boxes ADD CONSTRAINT storage_boxes_priority_check CHECK (priority >= 0) NOT VALID;
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid = 'storage_boxes'::regclass AND conname = 'storage_boxes_minimum_free_check') THEN
+    ALTER TABLE storage_boxes ADD CONSTRAINT storage_boxes_minimum_free_check CHECK ("minimumFreeBytes" >= 0) NOT VALID;
   END IF;
   IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid = 'storage_boxes'::regclass AND conname = 'storage_boxes_inactivity_days_check') THEN
     ALTER TABLE storage_boxes ADD CONSTRAINT storage_boxes_inactivity_days_check CHECK ("inactivityDays" > 0) NOT VALID;
@@ -161,7 +169,52 @@ INSERT INTO storage_boxes (
   100,
   15,
   99,
-  6,
+  8,
+  2,
+  60,
+  true
+)
+ON CONFLICT (id) DO UPDATE SET
+  provider = EXCLUDED.provider,
+  plan = EXCLUDED.plan,
+  hostname = EXCLUDED.hostname,
+  username = EXCLUDED.username,
+  "sshPort" = EXCLUDED."sshPort",
+  "sshKeyPath" = EXCLUDED."sshKeyPath",
+  "knownHostsPath" = EXCLUDED."knownHostsPath",
+  "basePath" = EXCLUDED."basePath",
+  "maxConnections" = EXCLUDED."maxConnections",
+  priority = EXCLUDED.priority,
+  "inactivityDays" = EXCLUDED."inactivityDays",
+  "maxUsagePercent" = EXCLUDED."maxUsagePercent",
+  "archiveConcurrency" = EXCLUDED."archiveConcurrency",
+  "restoreConcurrency" = EXCLUDED."restoreConcurrency",
+  "scanIntervalSeconds" = EXCLUDED."scanIntervalSeconds",
+  "isActive" = EXCLUDED."isActive",
+  "updatedAt" = CURRENT_TIMESTAMP;
+
+INSERT INTO storage_boxes (
+  id, provider, plan, hostname, username, "sshPort", "sshKeyPath",
+  "knownHostsPath", "basePath", "capacityBytes", "usedBytes",
+  "maxConnections", priority, "inactivityDays", "maxUsagePercent",
+  "archiveConcurrency", "restoreConcurrency", "scanIntervalSeconds", "isActive"
+) VALUES (
+  'hetzner-bx31-u659285',
+  'hetzner',
+  'BX31',
+  'u659285.your-storagebox.de',
+  'u659285',
+  23,
+  '/root/.ssh/firestream-storagebox-u654289',
+  '/root/.ssh/known_hosts',
+  'firestream/cold-videos',
+  10995116277760,
+  131072,
+  10,
+  200,
+  15,
+  99,
+  8,
   2,
   60,
   true
@@ -187,6 +240,7 @@ ON CONFLICT (id) DO UPDATE SET
 
 ALTER TABLE storage_boxes ALTER COLUMN "sshKeyPath" SET NOT NULL;
 ALTER TABLE storage_boxes VALIDATE CONSTRAINT storage_boxes_priority_check;
+ALTER TABLE storage_boxes VALIDATE CONSTRAINT storage_boxes_minimum_free_check;
 ALTER TABLE storage_boxes VALIDATE CONSTRAINT storage_boxes_inactivity_days_check;
 ALTER TABLE storage_boxes VALIDATE CONSTRAINT storage_boxes_max_usage_check;
 ALTER TABLE storage_boxes VALIDATE CONSTRAINT storage_boxes_concurrency_check;

@@ -41,6 +41,7 @@ Options:
   --batch-size N   Eligible rows fetched per batch (default: ${DEFAULT_BATCH_SIZE}, max: 500)
   --limit N        Stop after inspecting N eligible candidate rows
   --verbose        Print one decision per candidate
+  --nocache        Bypass the Redis confirmed-deletion cache
   --execute        Move eligible assets and update guarded database rows
   --scheduled      Run only during the configured 00:00/12:00 minute
   --help           Show this help
@@ -54,11 +55,12 @@ function parsePositiveInt(value, name) {
 }
 
 function parseArgs(argv) {
-  const options = { batchSize: DEFAULT_BATCH_SIZE, limit: null, verbose: false, execute: false, scheduled: false }
+  const options = { batchSize: DEFAULT_BATCH_SIZE, limit: null, verbose: false, noCache: false, execute: false, scheduled: false }
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i]
     if (arg === '--help') options.help = true
     else if (arg === '--verbose') options.verbose = true
+    else if (arg === '--nocache') options.noCache = true
     else if (arg === '--execute') options.execute = true
     else if (arg === '--scheduled') options.scheduled = true
     else if (arg === '--batch-size') options.batchSize = parsePositiveInt(argv[++i], '--batch-size')
@@ -834,7 +836,11 @@ async function main() {
     if (server.rows.length !== 1 || server.rows[0].type !== 'storage') throw new Error(`local IP ${localIp} is not one storage server`)
     const storageId = server.rows[0].id
     const cacheKey = `firestream:cleanup:${REDIS_CACHE_VERSION}:${storageId}:confirmed`
-    redis = await connectRedis(label)
+    if (options.noCache) {
+      console.log(`[${label}] Redis confirmed-deletion cache disabled`)
+    } else {
+      redis = await connectRedis(label)
+    }
 
     if (options.execute) {
       trashRun = prepareTrashRun()

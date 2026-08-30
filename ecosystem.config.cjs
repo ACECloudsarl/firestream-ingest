@@ -84,6 +84,22 @@ module.exports = {
       merge_logs: true
     },
     {
+      name: 'firestream-cold-stage',
+      script: 'scripts/cold-storage-stage.js',
+      args: '--execute',
+      cwd: __dirname,
+      autorestart: true,
+      max_memory_restart: '1G',
+      kill_timeout: 900000,
+      env: {
+        NODE_ENV: 'production'
+      },
+      log_date_format: 'YYYY-MM-DD HH:mm:ss',
+      error_file: '/var/log/firestream-dav/cold-stage-error.log',
+      out_file: '/var/log/firestream-dav/cold-stage-out.log',
+      merge_logs: true
+    },
+    {
       name: 'firestream-cold-restore',
       script: 'scripts/cold-storage-restore.js',
       cwd: __dirname,

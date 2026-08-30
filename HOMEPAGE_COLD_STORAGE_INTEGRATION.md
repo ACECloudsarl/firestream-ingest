@@ -1,7 +1,8 @@
 # Homepage Cold-Storage Integration
 
 The continuous cold archiver is active. Videos with no view in the previous 15
-days can have their local files temporarily moved to a Hetzner Storage Box.
+days can first be staged in the storage server's emergency local buffer and
+then moved to a Hetzner Storage Box.
 The homepage must request restoration before assigning a cold video URL to
 Plyr.
 
@@ -10,11 +11,26 @@ Plyr.
 Read these fields with the normal video metadata:
 
 - `coldStorage`: `true` when local video files are unavailable.
-- `coldStorageStatus`: `cold`, `restoring`, `failed`, or `local`.
+- `coldStorageStatus`: `staged`, `cold`, `restoring`, `failed`, or `local`.
 - `storageId`: identifies the production storage server that must restore it.
 
 Resolve `storageId` against `Server`. The restore API listens on that storage
 server's `coldStorageApiPort` (currently `3003`).
+
+## Storage Box overview
+
+The `storage_boxes` table is the dashboard source for each remote box. Safe
+fields to expose internally are `id`, `provider`, `plan`, `hostname`,
+`capacityBytes`, `usedBytes`, `minimumFreeBytes`, `acceptingUploads`,
+`isActive`, and `updatedAt`.
+
+- Remaining bytes: `capacityBytes - usedBytes`.
+- `acceptingUploads=false` means the box reached its configured free-space
+  reserve; restores and policy purges remain enabled.
+- `isActive=false` means the box was administratively disabled entirely.
+
+Do not expose `username`, `sshKeyPath`, `knownHostsPath`, or other connection
+credentials through the homepage API.
 
 ## Security
 
@@ -72,6 +88,10 @@ Example:
 waiting overlay. Progress is refreshed every five seconds; poll every five
 seconds until `ready` is `true`. Multiple visitors requesting
 the same video join the same restore operation.
+
+The same API handles both locations. A `staged` video is restored directly
+from the server's local emergency buffer; a `cold` video is downloaded from
+its Storage Box. The homepage does not need separate logic for them.
 
 ## Homepage/Plyr flow
 

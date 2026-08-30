@@ -16,8 +16,8 @@ import { INGEST_DIR } from '../config.js'
 const DATABASE_URL = process.env.DATABASE_URL
 const RETRY_MINUTES = 30
 const MISSING_SOURCE_RETRY_MINUTES = 24 * 60
-const SMALL_VIDEO_BYTES = 100_000_000
-const MEDIUM_VIDEO_BYTES = 200_000_000
+const STAGE_ROOT = process.env.COLD_STAGE_ROOT || '/cold-stage'
+const DEFAULT_MINIMUM_FREE_BYTES = 100_000_000_000
 const MAX_WAITING_INGEST_TRANSFERS = 8
 const INGEST_QUEUE_POLL_MS = 5_000
 const INGEST_QUEUE_LOG_MS = 60_000
@@ -333,7 +333,7 @@ async function removeRemoteArchive(box, remotePath) {
 
 const ELIGIBLE_SQL = `
   v."storageId" = $1
-  AND v.status IN ('active', 'offline')
+  AND v.status = 'active'
   AND v."encodingStatus" = 'completed'
   AND NOT v."coldStorage"
   AND v."coldStorageStatus" IN ('local', 'failed')
@@ -373,6 +373,7 @@ async function waitForIngestCapacity(client, storageId) {
   let paused = false
   let lastLogAt = 0
   while (!shuttingDown) {
+    if ((await fetchStagedBatch(client, storageId, 1)).ids.length > 0) return true
     const waiting = await countWaitingIngestTransfers(client, storageId)
     if (waiting <= MAX_WAITING_INGEST_TRANSFERS) {
       if (paused) {
@@ -397,7 +398,8 @@ async function loadStorageBoxes(client) {
     `SELECT id, hostname, username, "sshPort", "sshKeyPath",
             "knownHostsPath", "basePath", "capacityBytes", "maxConnections",
             priority, "inactivityDays", "maxUsagePercent", "archiveConcurrency",
-            "restoreConcurrency", "scanIntervalSeconds", "isActive"
+            "restoreConcurrency", "scanIntervalSeconds", "isActive",
+            "acceptingUploads", "minimumFreeBytes"
      FROM storage_boxes
      WHERE "isActive"
      ORDER BY priority, id`
@@ -408,13 +410,53 @@ async function loadStorageBoxes(client) {
     if (!box.sshKeyPath || !box.knownHostsPath) throw new Error(`SSH key paths are not configured for Storage Box ${box.id}`)
     box.basePath = assertSafeRemotePath(box.basePath)
     box.inactivityDays = Number(box.inactivityDays)
-    box.maxUsageRatio = Number(box.maxUsagePercent) / 100
     box.archiveConcurrency = Number(box.archiveConcurrency)
     box.restoreConcurrency = Number(box.restoreConcurrency)
     box.scanIntervalMs = Number(box.scanIntervalSeconds) * 1000
+    box.minimumFreeBytes = Number(box.minimumFreeBytes || DEFAULT_MINIMUM_FREE_BYTES)
     if (box.archiveConcurrency + box.restoreConcurrency > box.maxConnections) throw new Error(`connection policy exceeds the limit for Storage Box ${box.id}`)
     return box
   })
+}
+
+async function refreshStorageBoxUsage(client, boxes) {
+  const checks = await Promise.all(boxes.map(async box => {
+    try {
+      return { box, usage: await remoteUsage(box), error: null }
+    } catch (error) {
+      return { box, usage: null, error }
+    }
+  }))
+  const refreshed = []
+  for (const check of checks) {
+    const { box, usage, error } = check
+    if (error) {
+      log(`box ${box.id}: usage check failed; skipping its upload lane this round: ${error.message}`)
+      refreshed.push({ ...box, usage: null, reachable: false })
+      continue
+    }
+    const remaining = Math.max(0, usage.total - usage.used)
+    const acceptingUploads = remaining > box.minimumFreeBytes
+    const update = await client.query(
+      `UPDATE storage_boxes
+       SET "capacityBytes" = $2, "usedBytes" = $3, "acceptingUploads" = $4,
+           "updatedAt" = NOW()
+       WHERE id = $1
+       RETURNING "acceptingUploads"`,
+      [box.id, usage.total, usage.used, acceptingUploads]
+    )
+    if (Boolean(box.acceptingUploads) !== acceptingUploads) {
+      log(`box ${box.id}: upload lane ${acceptingUploads ? 'AUTO-ACTIVATED' : 'AUTO-DISABLED'}; ${formatBytes(remaining)} free (threshold ${formatBytes(box.minimumFreeBytes)})`)
+    }
+    refreshed.push({
+      ...box,
+      acceptingUploads: Boolean(update.rows[0]?.acceptingUploads),
+      usage,
+      remaining,
+      reachable: true,
+    })
+  }
+  return refreshed
 }
 
 async function recoverStaleOperations(client, storageId) {
@@ -429,6 +471,36 @@ async function recoverStaleOperations(client, storageId) {
     [storageId]
   )
   if (rowCount > 0) log(`recovered ${rowCount} stale archive/purge operation(s)`)
+}
+
+async function recoverStaleStaging(client, storageId) {
+  const { rows } = await client.query(
+    `SELECT s."videoId", s."stagePath", s.bytes AS "stageBytes",
+            s.files AS "stageFiles", s.checksum AS "stageChecksum",
+            v."coldStorageStatus", v."coldStorageId"
+     FROM cold_storage_staging s
+     JOIN "Video" v ON v.id = s."videoId"
+     WHERE s."storageId" = $1 AND s.status = 'uploading'`,
+    [storageId]
+  )
+  let reset = 0
+  let drained = 0
+  for (const row of rows) {
+    if (row.coldStorageStatus === 'cold' && row.coldStorageId) {
+      await rm(row.stagePath, { recursive: true, force: true, maxRetries: 3, retryDelay: 1000 }).catch(() => {})
+      await client.query(`DELETE FROM cold_storage_staging WHERE "videoId" = $1`, [row.videoId])
+      drained++
+      continue
+    }
+    await resetStagedCandidate(client, {
+      id: row.videoId,
+      stagePath: row.stagePath,
+      stageBytes: row.stageBytes,
+      stageChecksum: row.stageChecksum,
+    }, new Error('recovered interrupted staged upload'))
+    reset++
+  }
+  if (reset > 0 || drained > 0) log(`recovered staged uploads: ${reset} reset, ${drained} already-remote duplicate(s) removed`)
 }
 
 async function dryRun(client, storageId, box, options) {
@@ -452,38 +524,36 @@ async function dryRun(client, storageId, box, options) {
   }
 }
 
-function adaptiveBatch(rows, maximum) {
-  if (rows.length === 0) return { ids: [], label: 'empty' }
-  const firstSize = Number(rows[0].encodedSize)
-  const validFirstSize = Number.isFinite(firstSize) && firstSize > 0
-  let target
-  let matches
-  let label
-  if (validFirstSize && firstSize < SMALL_VIDEO_BYTES) {
-    target = 8
-    label = '<100 MB'
-    matches = row => Number(row.encodedSize) > 0 && Number(row.encodedSize) < SMALL_VIDEO_BYTES
-  } else if (validFirstSize && firstSize <= MEDIUM_VIDEO_BYTES) {
-    target = 3
-    label = '100-200 MB'
-    matches = row => Number(row.encodedSize) >= SMALL_VIDEO_BYTES && Number(row.encodedSize) <= MEDIUM_VIDEO_BYTES
-  } else {
-    target = 1
-    label = '>200 MB or unknown'
-    matches = () => true
+async function fetchStagedBatch(client, storageId, limit) {
+  const { rows } = await client.query(
+    `SELECT s."videoId" AS id, s.bytes AS "encodedSize"
+     FROM cold_storage_staging s
+     JOIN "Video" v ON v.id = s."videoId"
+     WHERE s."storageId" = $1
+       AND s.status = 'ready'
+       AND (s."retryAt" IS NULL OR s."retryAt" <= NOW())
+       AND v.status = 'active'
+       AND v."coldStorage"
+       AND v."coldStorageStatus" = 'staged'
+     ORDER BY s."readyAt", s."videoId"
+     LIMIT $2`,
+    [storageId, limit]
+  )
+  return {
+    ids: rows.map(row => row.id),
+    candidates: rows.map(row => ({ id: row.id, bytes: Number(row.encodedSize) })),
+    label: 'locally staged',
   }
-  const ids = rows.filter(matches).slice(0, Math.min(target, maximum)).map(row => row.id)
-  return { ids, label }
 }
 
-async function fetchCandidateBatch(client, storageId, inactivityDays, limit) {
+async function fetchParallelCandidates(client, storageId, inactivityDays, limit) {
   const { rows } = await client.query(
     `SELECT v.id, v."encodedSize" FROM "Video" v WHERE ${ELIGIBLE_SQL}
      ORDER BY NULLIF(v."encodedSize", 0) ASC NULLS LAST,
               COALESCE(v."lastView", v."createdAt"), v.id LIMIT $3`,
     [storageId, inactivityDays, limit]
   )
-  return adaptiveBatch(rows, limit)
+  return rows.map(row => ({ id: row.id, bytes: Number(row.encodedSize) }))
 }
 
 async function claimCandidate(client, storageId, inactivityDays, videoId) {
@@ -499,6 +569,100 @@ async function claimCandidate(client, storageId, inactivityDays, videoId) {
     [storageId, inactivityDays, videoId]
   )
   return rows[0] || null
+}
+
+async function claimStagedCandidate(client, storageId, videoId) {
+  await client.query('BEGIN')
+  try {
+    const { rows } = await client.query(
+      `SELECT v.id, v."userId", v.status, v."encodingStatus", v."encodedPath",
+              v."encodedSize", v."lastView", v."createdAt",
+              s."stagePath", s.bytes AS "stageBytes", s.files AS "stageFiles",
+              s.checksum AS "stageChecksum"
+       FROM cold_storage_staging s
+       JOIN "Video" v ON v.id = s."videoId"
+       WHERE s."videoId" = $2
+         AND s."storageId" = $1
+         AND s.status = 'ready'
+         AND v."storageId" = $1
+         AND v.status = 'active'
+         AND v."coldStorage"
+         AND v."coldStorageStatus" = 'staged'
+       FOR UPDATE OF s, v`,
+      [storageId, videoId]
+    )
+    if (rows.length !== 1) {
+      await client.query('ROLLBACK')
+      return null
+    }
+    await client.query(
+      `UPDATE cold_storage_staging
+       SET status = 'uploading', error = NULL, "updatedAt" = NOW()
+       WHERE "videoId" = $1`,
+      [videoId]
+    )
+    await client.query(
+      `UPDATE "Video"
+       SET "coldStorageStatus" = 'archiving', "coldStorageUpdatedAt" = NOW(),
+           "coldStorageRetryAt" = NULL, "coldStorageError" = NULL
+       WHERE id = $1`,
+      [videoId]
+    )
+    await client.query('COMMIT')
+    return { ...rows[0], staged: true }
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => {})
+    throw error
+  }
+}
+
+async function resolveStagedDirectory(stagePath) {
+  const root = await realpath(STAGE_ROOT)
+  const expected = path.resolve(String(stagePath || ''))
+  if (expected === root || !expected.startsWith(`${root}${path.sep}`)) throw new Error('staged path escapes staging root')
+  const actual = await realpath(expected)
+  if (actual !== expected || !actual.startsWith(`${root}${path.sep}`)) throw new Error('staged path is a symlink or escapes staging root')
+  const info = await lstat(actual)
+  if (!info.isDirectory() || info.isSymbolicLink()) throw new Error('staged path is not a safe directory')
+  return actual
+}
+
+async function resetStagedCandidate(client, video, error = null) {
+  const message = error ? String(error.message || error).slice(0, 2000) : null
+  await client.query('BEGIN')
+  try {
+    const current = await client.query(
+      `SELECT status, "restoreRequestedAt" FROM "Video" WHERE id = $1 FOR UPDATE`,
+      [video.id]
+    )
+    const restoreRequested = current.rows[0]?.status === 'active' && Boolean(current.rows[0]?.restoreRequestedAt)
+    await client.query(
+      `UPDATE cold_storage_staging
+       SET status = $4, error = $2, "retryAt" = CASE WHEN $2::text IS NULL OR $4 = 'restoring' THEN NULL ELSE NOW() + make_interval(mins => $3) END,
+           "updatedAt" = NOW()
+       WHERE "videoId" = $1`,
+      [video.id, message, RETRY_MINUTES, restoreRequested ? 'restoring' : 'ready']
+    )
+    await client.query(
+      `UPDATE "Video"
+       SET "coldStorage" = true, "coldStorageStatus" = $6,
+           "coldStorageId" = NULL, "coldStoragePath" = $2,
+           "coldStorageChecksum" = $3, "coldStorageBytes" = $4,
+           "coldStorageUpdatedAt" = NOW(), "coldStorageRetryAt" = NULL,
+           "coldStorageError" = $5
+       WHERE id = $1`,
+      [video.id, video.stagePath, video.stageChecksum, Number(video.stageBytes || 0), message, restoreRequested ? 'restoring' : 'staged']
+    )
+    await client.query('COMMIT')
+  } catch (resetError) {
+    await client.query('ROLLBACK').catch(() => {})
+    throw resetError
+  }
+}
+
+async function removeCompletedStage(client, video) {
+  await rm(video.stagePath, { recursive: true, force: false, maxRetries: 3, retryDelay: 1000 })
+  await client.query(`DELETE FROM cold_storage_staging WHERE "videoId" = $1`, [video.id])
 }
 
 async function markFailure(client, videoId, error) {
@@ -543,18 +707,20 @@ async function reserveBoxCapacity(client, videoId, box, bytes) {
   await client.query('BEGIN')
   try {
     const { rows } = await client.query(
-      `SELECT "usedBytes", "capacityBytes", "maxUsagePercent"
-       FROM storage_boxes WHERE id = $1 AND "isActive" FOR UPDATE`,
+      `SELECT "usedBytes", "capacityBytes", "minimumFreeBytes"
+       FROM storage_boxes
+       WHERE id = $1 AND "isActive" AND "acceptingUploads"
+       FOR UPDATE`,
       [box.id]
     )
-    if (rows.length !== 1) throw new Error(`Storage Box ${box.id} is no longer active`)
+    if (rows.length !== 1) throw new Error(`Storage Box ${box.id} is not accepting uploads`)
     const reserved = await client.query(
       `SELECT COALESCE(sum("coldStorageBytes"), 0)::text AS bytes
        FROM "Video"
        WHERE "coldStorageId" = $1 AND "coldStorageStatus" = 'archiving' AND id <> $2`,
       [box.id, videoId]
     )
-    const maximum = Math.floor(Number(rows[0].capacityBytes) * Number(rows[0].maxUsagePercent) / 100)
+    const maximum = Number(rows[0].capacityBytes) - Number(rows[0].minimumFreeBytes)
     if (Number(rows[0].usedBytes) + Number(reserved.rows[0].bytes) + bytes > maximum) {
       await client.query('ROLLBACK')
       return false
@@ -655,7 +821,11 @@ async function purgeTerminalColdVideo(pool, storageId, boxesById) {
     if (update.rowCount !== 1) throw new Error('terminal video changed while its cold copy was being purged')
     await client.query(
       `UPDATE storage_boxes
-       SET "usedBytes" = GREATEST(0, "usedBytes" - $2), "updatedAt" = NOW()
+       SET "usedBytes" = GREATEST(0, "usedBytes" - $2),
+           "acceptingUploads" = (
+             "capacityBytes" - GREATEST(0, "usedBytes" - $2) > "minimumFreeBytes"
+           ),
+           "updatedAt" = NOW()
        WHERE id = $1`,
       [box.id, Number(video.coldStorageBytes || 0)]
     )
@@ -700,7 +870,7 @@ async function finalizeDatabase(client, storageId, video, box, remotePath, inspe
     const activityAt = new Date(current.lastView || current.createdAt).getTime()
     const cutoff = Date.now() - box.inactivityDays * 86_400_000
     const stillEligible = current.storageId === storageId
-      && ['active', 'offline'].includes(current.status)
+      && current.status === 'active'
       && current.encodingStatus === 'completed'
       && current.coldStorageStatus === 'archiving'
       && !current.clonedFrom
@@ -773,7 +943,7 @@ async function reclaimLocalDirectory(client, sourceDir, videoId) {
     )
     const current = rows[0]
     if (!current
-      || !['active', 'offline'].includes(current.status)
+      || current.status !== 'active'
       || !current.coldStorage
       || current.coldStorageStatus !== 'cold') {
       await client.query('COMMIT')
@@ -797,16 +967,27 @@ async function processCandidate(pool, storageId, box, videoId, capacity) {
   let reserved = 0
   let slot = null
   try {
-    video = await claimCandidate(client, storageId, box.inactivityDays, videoId)
+    video = await claimStagedCandidate(client, storageId, videoId)
+      || await claimCandidate(client, storageId, box.inactivityDays, videoId)
     if (!video) return { action: 'stale' }
-    const sourceDir = await resolveAssetDirectory(video)
+    const sourceDir = video.staged
+      ? await resolveStagedDirectory(video.stagePath)
+      : await resolveAssetDirectory(video)
     const inspection = await inspectAndHashForArchive(sourceDir, video.id)
+    if (video.staged && (
+      inspection.totalBytes !== Number(video.stageBytes)
+      || inspection.files !== Number(video.stageFiles)
+    )) throw new Error('staged source no longer matches its verified manifest')
     if (capacity.used + capacity.reserved + inspection.totalBytes > capacity.maximum) {
-      await markFailure(client, video.id, new Error('Storage Box 99% capacity ceiling would be exceeded'))
+      const error = new Error(`Storage Box minimum-free reserve of ${formatBytes(box.minimumFreeBytes)} would be exceeded`)
+      if (video.staged) await resetStagedCandidate(client, video, error)
+      else await markFailure(client, video.id, error)
       return { action: 'capacity_skip', bytes: inspection.totalBytes }
     }
     if (!await reserveBoxCapacity(client, video.id, box, inspection.totalBytes)) {
-      await markFailure(client, video.id, new Error('Storage Box capacity is currently reserved by other workers'))
+      const error = new Error('Storage Box capacity is currently reserved by other workers')
+      if (video.staged) await resetStagedCandidate(client, video, error)
+      else await markFailure(client, video.id, error)
       return { action: 'capacity_skip', bytes: inspection.totalBytes }
     }
     capacity.reserved += inspection.totalBytes
@@ -832,49 +1013,114 @@ async function processCandidate(pool, storageId, box, videoId, capacity) {
     reserved = 0
     if (outcome === 'retained') {
       await removeRemoteArchive(box, finalPath)
-      await client.query(
-        `UPDATE "Video"
-         SET "coldStorageId" = NULL, "coldStoragePath" = NULL,
-             "coldStorageChecksum" = NULL, "coldStorageBytes" = NULL,
-             "coldStorageUpdatedAt" = NOW()
-         WHERE id = $1 AND NOT "coldStorage" AND "coldStorageStatus" = 'local' AND "coldStoragePath" = $2`,
-        [video.id, finalPath]
-      )
-      log(`${video.id}: became active or shared during upload; retained locally`)
+      if (video.staged) {
+        await resetStagedCandidate(client, video)
+        log(`${video.id}: became ineligible or shared during upload; retained in local staging`)
+      } else {
+        await client.query(
+          `UPDATE "Video"
+           SET "coldStorageId" = NULL, "coldStoragePath" = NULL,
+               "coldStorageChecksum" = NULL, "coldStorageBytes" = NULL,
+               "coldStorageUpdatedAt" = NOW()
+           WHERE id = $1 AND NOT "coldStorage" AND "coldStorageStatus" = 'local' AND "coldStoragePath" = $2`,
+          [video.id, finalPath]
+        )
+        log(`${video.id}: became ineligible or shared during upload; retained locally`)
+      }
       return { action: 'retained', bytes: inspection.totalBytes }
     }
     capacity.used += inspection.totalBytes
     if (outcome === 'terminal') {
+      if (video.staged) {
+        await removeCompletedStage(client, video).catch(error => {
+          log(`${video.id}: remote archive is safe but staged duplicate cleanup failed: ${error.message}`)
+        })
+      }
       log(`${video.id}: became permanently deleted during upload; queued remote purge`)
       return { action: 'terminal', bytes: inspection.totalBytes }
     }
 
-    const reclaimed = await reclaimLocalDirectory(client, sourceDir, video.id)
-    if (!reclaimed) {
-      log(`${video.id}: state changed before local reclamation; local directory retained`)
-      return { action: 'retained', bytes: inspection.totalBytes }
+    if (video.staged) {
+      await removeCompletedStage(client, video).catch(error => {
+        log(`${video.id}: remote archive is safe but staged duplicate cleanup failed: ${error.message}`)
+      })
+    } else {
+      const reclaimed = await reclaimLocalDirectory(client, sourceDir, video.id)
+      if (!reclaimed) {
+        log(`${video.id}: state changed before local reclamation; local directory retained`)
+        return { action: 'retained', bytes: inspection.totalBytes }
+      }
     }
     await client.query(
-      `UPDATE storage_boxes SET "usedBytes" = "usedBytes" + $2, "updatedAt" = NOW() WHERE id = $1`,
+      `UPDATE storage_boxes
+       SET "usedBytes" = "usedBytes" + $2,
+           "acceptingUploads" = (
+             "capacityBytes" - ("usedBytes" + $2) > "minimumFreeBytes"
+           ),
+           "updatedAt" = NOW()
+       WHERE id = $1`,
       [box.id, inspection.totalBytes]
     )
-    log(`${video.id}: archived and freed ${formatBytes(inspection.totalBytes)} (${inspection.files} files)`)
+    log(`${video.id}: archived and ${video.staged ? 'drained local staging' : 'freed local storage'} ${formatBytes(inspection.totalBytes)} (${inspection.files} files)`)
     return { action: 'archived', bytes: inspection.totalBytes }
   } catch (error) {
     if (reserved > 0) capacity.reserved -= reserved
-    if (video && error?.code === 'ENOENT') {
+    if (video && !video.staged && error?.code === 'ENOENT') {
       const audit = await markMissingSource(client, video, error).catch(() => null)
       const auditText = audit ? `; audit=${audit.deleteType}/${audit.reason}` : ''
       log(`${videoId}: SKIP missing local source; DB=${video.status}/${video.encodingStatus}${auditText}; retry in 24h`)
       return { action: 'missing', error }
     }
-    if (video) await markFailure(client, video.id, error).catch(() => {})
+    if (video?.staged) await resetStagedCandidate(client, video, error).catch(() => {})
+    else if (video) await markFailure(client, video.id, error).catch(() => {})
     log(`${videoId}: ERROR ${error.message}`)
     return { action: 'error', error }
   } finally {
     await releaseArchiveSlot(client, box, slot)
     client.release()
   }
+}
+
+async function buildUploadLanes(client, boxes) {
+  const lanes = []
+  for (const box of boxes) {
+    if (!box.reachable || !box.acceptingUploads || !box.usage) continue
+    const reservation = await client.query(
+      `SELECT COALESCE(sum("coldStorageBytes"), 0)::text AS bytes
+       FROM "Video" WHERE "coldStorageId" = $1 AND "coldStorageStatus" = 'archiving'`,
+      [box.id]
+    )
+    const globallyReserved = Number(reservation.rows[0].bytes)
+    const maximum = box.usage.total - box.minimumFreeBytes
+    const available = maximum - box.usage.used - globallyReserved
+    if (available <= 0) continue
+    lanes.push({
+      box,
+      available,
+      capacity: {
+        used: box.usage.used + globallyReserved,
+        reserved: 0,
+        maximum,
+      },
+    })
+  }
+  return lanes
+}
+
+function assignOneCandidatePerBox(candidates, lanes, maximum) {
+  const remainingLanes = [...lanes]
+  const assignments = []
+  for (const candidate of candidates) {
+    if (assignments.length >= maximum || remainingLanes.length === 0) break
+    const bytes = Number(candidate.bytes)
+    const laneIndex = remainingLanes.findIndex(lane =>
+      !Number.isFinite(bytes) || bytes <= 0 || bytes <= lane.available
+    )
+    if (laneIndex === -1) continue
+    const [lane] = remainingLanes.splice(laneIndex, 1)
+    assignments.push({ ...lane, id: candidate.id })
+  }
+  return assignments
 }
 
 async function main() {
@@ -895,77 +1141,85 @@ async function main() {
     let boxes = await loadStorageBoxes(control)
 
     if (!options.execute) return await dryRun(control, storageId, boxes[0], options)
+    await recoverStaleStaging(control, storageId)
     await recoverStaleOperations(control, storageId)
+    boxes = await refreshStorageBoxUsage(control, boxes)
     for (const box of boxes) {
-      const initialUsage = await remoteUsage(box)
-      log(`box ${box.id}: ${box.hostname}; usage ${formatBytes(initialUsage.used)}/${formatBytes(initialUsage.total)} (${(initialUsage.ratio * 100).toFixed(2)}%)`)
+      if (!box.usage) continue
+      log(`box ${box.id}: ${box.hostname}; usage ${formatBytes(box.usage.used)}/${formatBytes(box.usage.total)} (${(box.usage.ratio * 100).toFixed(2)}%); ${formatBytes(box.remaining)} free`)
       log(`box ${box.id}: ${box.inactivityDays} inactive days; ${box.archiveConcurrency} archive + ${box.restoreConcurrency} restore connections`)
-      log(`box ${box.id}: fast exact-size manifests enabled; uploads remain concurrent`)
-      log(`box ${box.id}: adaptive batches <100 MB=8, 100-200 MB=3, >200 MB=1`)
+      log(`box ${box.id}: one parallel upload lane; auto-disables uploads at ${formatBytes(box.minimumFreeBytes)} free`)
     }
 
     let handled = 0
     while (!shuttingDown && (options.limit === null || handled < options.limit)) {
       boxes = await loadStorageBoxes(control)
-      if (!await waitForIngestCapacity(control, storageId)) break
+      boxes = await refreshStorageBoxUsage(control, boxes)
       const boxesById = new Map(boxes.map(box => [box.id, box]))
+
+      // Permanent policy deletions always get a chance to release remote space,
+      // even while the emergency local staging queue remains busy.
       if (await purgeTerminalColdVideo(pool, storageId, boxesById)) continue
-      let selected = null
-      for (const box of boxes) {
-        const usage = await remoteUsage(box)
-        await control.query(
-          `UPDATE storage_boxes
-           SET "capacityBytes" = $2, "usedBytes" = GREATEST("usedBytes", $3), "updatedAt" = NOW()
-           WHERE id = $1`,
-          [box.id, usage.total, usage.used]
-        )
-        const reservation = await control.query(
-          `SELECT COALESCE(sum("coldStorageBytes"), 0)::text AS bytes
-           FROM "Video" WHERE "coldStorageId" = $1 AND "coldStorageStatus" = 'archiving'`,
-          [box.id]
-        )
-        const maximum = Math.floor(usage.total * box.maxUsageRatio)
-        if (usage.used + Number(reservation.rows[0].bytes) < maximum) {
-          selected = { box, usage, maximum, globallyReserved: Number(reservation.rows[0].bytes) }
-          break
-        }
-        log(`box ${box.id} is at its ${box.maxUsagePercent}% ceiling; trying the next box`)
-      }
-      if (!selected) {
-        log('all Storage Boxes reached their configured capacity ceiling; stopping')
-        break
-      }
-      const { box, usage } = selected
-      const capacity = {
-        used: usage.used + selected.globallyReserved,
-        reserved: 0,
-        maximum: selected.maximum,
-      }
-      // The remote usage check can take a few seconds. Recheck immediately before
-      // starting uploads so newly queued production transfers always win.
-      if (!await waitForIngestCapacity(control, storageId)) break
-      const remaining = options.limit === null
-        ? box.archiveConcurrency
-        : Math.min(box.archiveConcurrency, options.limit - handled)
-      const batch = options.videoId && handled === 0
-        ? { ids: [options.videoId], label: 'explicit video' }
-        : await fetchCandidateBatch(control, storageId, box.inactivityDays, remaining)
-      const { ids } = batch
-      if (ids.length === 0) {
-        log('no eligible videos found')
+
+      const lanes = await buildUploadLanes(control, boxes)
+      if (lanes.length === 0) {
+        log(`no reachable Storage Box has more than ${formatBytes(DEFAULT_MINIMUM_FREE_BYTES)} free; rechecking automatically`)
         if (options.once) break
-        await sleep(box.scanIntervalMs)
+        await sleep(Math.min(...boxes.map(box => box.scanIntervalMs)))
         continue
       }
-      log(`box ${box.id}: selected ${ids.length} ${batch.label} video(s)`)
+      const remainingLimit = options.limit === null
+        ? lanes.length
+        : Math.min(lanes.length, options.limit - handled)
+      let stagedBatch = options.videoId
+        ? { ids: [], candidates: [], label: 'empty' }
+        : await fetchStagedBatch(control, storageId, remainingLimit)
+      let hasStagedBatch = stagedBatch.ids.length > 0
+      if (!hasStagedBatch) {
+        if (!await waitForIngestCapacity(control, storageId)) break
+        stagedBatch = options.videoId
+          ? { ids: [], candidates: [], label: 'empty' }
+          : await fetchStagedBatch(control, storageId, remainingLimit)
+        hasStagedBatch = stagedBatch.ids.length > 0
+      }
+      // Staged uploads drain the emergency root buffer and bypass the ingest queue
+      // gate. Normal /home archives still yield to production transfers.
+      if (!hasStagedBatch && !await waitForIngestCapacity(control, storageId)) break
+      let candidates
+      let label
+      if (options.videoId && handled === 0) {
+        candidates = [{ id: options.videoId, bytes: 0 }]
+        label = 'explicit video'
+      } else if (hasStagedBatch) {
+        candidates = stagedBatch.candidates
+        label = stagedBatch.label
+      } else {
+        const inactivityDays = Math.max(...lanes.map(lane => lane.box.inactivityDays))
+        candidates = await fetchParallelCandidates(control, storageId, inactivityDays, remainingLimit * 4)
+        label = 'eligible local'
+      }
+      const assignments = assignOneCandidatePerBox(candidates, lanes, remainingLimit)
+      if (assignments.length === 0) {
+        log('no eligible videos found')
+        if (options.once) break
+        await sleep(Math.min(...boxes.map(box => box.scanIntervalMs)))
+        continue
+      }
+      for (const assignment of assignments) {
+        log(`box ${assignment.box.id}: selected ${assignment.id} (${label}); one lane for this box`)
+      }
       const batchStartedAt = Date.now()
-      const results = await Promise.all(ids.map(id => processCandidate(pool, storageId, box, id, capacity)))
+      const results = await Promise.all(assignments.map(async assignment => ({
+        boxId: assignment.box.id,
+        ...(await processCandidate(pool, storageId, assignment.box, assignment.id, assignment.capacity)),
+      })))
       handled += results.length
       const archived = results.filter(result => result.action === 'archived')
       const freed = archived.reduce((sum, result) => sum + result.bytes, 0)
       const batchElapsedMs = Math.max(Date.now() - batchStartedAt, 1)
       const batchRate = freed > 0 ? `; effective ${formatRate(freed / (batchElapsedMs / 1000))}` : ''
-      log(`box ${box.id}: batch complete: ${archived.length}/${results.length} archived; ${formatBytes(freed)} freed in ${formatDuration(batchElapsedMs)}${batchRate}; ${handled} handled this run`)
+      const byteAction = hasStagedBatch ? 'drained from staging' : 'freed from /home'
+      log(`multi-box batch complete: ${archived.length}/${results.length} archived across ${assignments.length} box lane(s); ${formatBytes(freed)} ${byteAction} in ${formatDuration(batchElapsedMs)}${batchRate}; ${handled} handled this run`)
       if (options.once) break
     }
   } finally {
