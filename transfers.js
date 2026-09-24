@@ -369,16 +369,22 @@ async function transferVideo(video) {
     return
   }
 
-  // Build asset list (includes DB query for subtitle files)
-  const assets = await buildAssetList(encoderUrl, videoId, userId, isMulti)
-  const tmpDir = path.join(INGEST_DIR, userId, videoId)
-
-  // Ensure target directories exist
-  for (const a of assets) {
-    fs.mkdirSync(a.dir, { recursive: true })
+  // Build the manifest and local directories before starting aria2c. These
+  // operations can fail with ENOSPC; handle that per video so one full disk
+  // cannot crash the worker and strand every claimed row as "transferring".
+  let assets
+  let tmpDir
+  let inputFile
+  try {
+    assets = await buildAssetList(encoderUrl, videoId, userId, isMulti)
+    tmpDir = path.join(INGEST_DIR, userId, videoId)
+    for (const asset of assets) fs.mkdirSync(asset.dir, { recursive: true })
+    inputFile = writeAria2cInput(assets, tmpDir)
+  } catch (err) {
+    log(`[${label}] ERROR preparing transfer: ${err.message}`)
+    await failTransfer(videoId, `transfer setup: ${err.message}`)
+    return
   }
-
-  const inputFile = writeAria2cInput(assets, tmpDir)
 
   // Track progress: poll file sizes every 3s and update DB
   let progressInterval = null

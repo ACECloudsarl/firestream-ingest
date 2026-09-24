@@ -78,7 +78,7 @@ module.exports = {
       env: {
         NODE_ENV: 'production'
       },
-      log_date_format: 'YYYY-MM-DD HH:mm:ss',
+      log_date_format: 'HH:mm:ss',
       error_file: '/var/log/firestream-dav/cold-transfer-error.log',
       out_file: '/var/log/firestream-dav/cold-transfer-out.log',
       merge_logs: true

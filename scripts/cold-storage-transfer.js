@@ -19,6 +19,9 @@ const MISSING_SOURCE_RETRY_MINUTES = 24 * 60
 const STAGE_ROOT = process.env.COLD_STAGE_ROOT || '/cold-stage'
 const DEFAULT_MINIMUM_FREE_BYTES = 100_000_000_000
 const MAX_WAITING_INGEST_TRANSFERS = 8
+const TARGET_UPLOAD_LANES_PER_BOX = 3
+const UPLOAD_WINDOW_PER_LANE = 8
+const FTP_PROGRESS_LOG_MS = 3_000
 const INGEST_QUEUE_POLL_MS = 5_000
 const INGEST_QUEUE_LOG_MS = 60_000
 const DELETE_ROOT = path.join(path.dirname(path.resolve(INGEST_DIR)), 'cold-delete')
@@ -89,25 +92,26 @@ function formatDuration(milliseconds) {
   return seconds < 10 ? `${seconds.toFixed(1)}s` : `${Math.round(seconds)}s`
 }
 
-const SIZE_UNITS = new Map([
-  ['B', 1], ['kB', 1000], ['MB', 1000 ** 2], ['GB', 1000 ** 3], ['TB', 1000 ** 4],
-  ['KiB', 1024], ['MiB', 1024 ** 2], ['GiB', 1024 ** 3], ['TiB', 1024 ** 4],
-])
+function formatBoxLabel(box) {
+  const value = typeof box === 'object' ? (box.plan || box.id) : box
+  const match = String(value).match(/bx-?(\d+)/i)
+  return match ? `BX-${match[1]}` : String(value)
+}
 
-function parseRcloneProgress(text) {
-  const clean = text.replace(/\x1b\[[0-9;]*[A-Za-z]/g, '')
-  const matches = [...clean.matchAll(/(?:Transferred:\s*)?([\d.]+)\s*([kKMGT]i?B)\s*\/\s*[\d.]+\s*[kKMGT]i?B,\s*(\d+)%\s*,\s*([\d.]+)\s*([kKMGT]i?B)\/s/gi)]
-  const match = matches.at(-1)
-  if (!match) return null
-  const normalizeUnit = unit => unit.length === 2
-    ? `${unit[0] === 'K' ? 'k' : unit[0].toUpperCase()}B`
-    : `${unit[0] === 'K' ? 'K' : unit[0].toUpperCase()}iB`
-  const byteUnit = normalizeUnit(match[2])
-  const rateUnit = normalizeUnit(match[5])
+function parseCurlSize(value) {
+  const match = String(value || '').match(/^([\d.]+)([kMGTPE]?)$/i)
+  if (!match) return 0
+  const powers = { '': 0, k: 1, m: 2, g: 3, t: 4, p: 5, e: 6 }
+  return Number(match[1]) * (1024 ** powers[match[2].toLowerCase()])
+}
+
+function parseCurlProgressLine(line) {
+  const columns = line.trim().split(/\s+/)
+  if (columns.length < 12 || !/^\d+$/.test(columns[4] || '')) return null
   return {
-    bytes: Number(match[1]) * (SIZE_UNITS.get(byteUnit) || 1),
-    percent: Number(match[3]),
-    speedBytesPerSecond: Number(match[4]) * (SIZE_UNITS.get(rateUnit) || 1),
+    bytes: parseCurlSize(columns[5]),
+    percent: Number(columns[4]),
+    speedBytesPerSecond: parseCurlSize(columns.at(-1)),
   }
 }
 
@@ -142,13 +146,9 @@ function sshBaseArgs(box) {
   ]
 }
 
-function rsyncSsh(box) {
-  return ['ssh', ...sshBaseArgs(box)].join(' ')
-}
-
-function runCommand(command, args, { allowFailure = false, onOutput = null, timeoutMs = 0 } = {}) {
+function runCommand(command, args, { allowFailure = false, input = null, onOutput = null, timeoutMs = 0 } = {}) {
   return new Promise((resolve, reject) => {
-    const child = spawn(command, args, { stdio: ['ignore', 'pipe', 'pipe'] })
+    const child = spawn(command, args, { stdio: [input === null ? 'ignore' : 'pipe', 'pipe', 'pipe'] })
     let stdout = ''
     let stderr = ''
     let timer = null
@@ -161,6 +161,12 @@ function runCommand(command, args, { allowFailure = false, onOutput = null, time
     child.stdout.on('data', chunk => collect(chunk, 'stdout'))
     child.stderr.on('data', chunk => collect(chunk, 'stderr'))
     child.on('error', reject)
+    if (input !== null) {
+      child.stdin.on('error', error => {
+        if (error.code !== 'EPIPE') reject(error)
+      })
+      child.stdin.end(input)
+    }
     if (timeoutMs > 0) {
       timer = setTimeout(() => child.kill('SIGTERM'), timeoutMs)
       timer.unref()
@@ -169,7 +175,11 @@ function runCommand(command, args, { allowFailure = false, onOutput = null, time
       if (timer) clearTimeout(timer)
       const result = { code, signal, stdout, stderr }
       if (code === 0 || allowFailure) resolve(result)
-      else reject(new Error(`${command} exited ${code}${stderr.trim() ? `: ${stderr.trim()}` : ''}`))
+      else {
+        const detail = stderr.trim().split(/[\r\n]+/).filter(Boolean).at(-1)?.slice(-2_000)
+        const outcome = code === null ? `signal ${signal || 'unknown'}` : `code ${code}`
+        reject(new Error(`${command} exited with ${outcome}${detail ? `: ${detail}` : ''}`))
+      }
     })
   })
 }
@@ -181,10 +191,6 @@ async function runSsh(box, command, commandArgs = [], options = {}) {
   }
   const destination = `${assertSafeComponent(box.username, 'Storage Box username')}@${box.hostname}`
   return runCommand('ssh', [...sshBaseArgs(box), destination, command, ...commandArgs], options)
-}
-
-function remoteSpec(box, remotePath) {
-  return `${assertSafeComponent(box.username, 'Storage Box username')}@${box.hostname}:./${assertSafeRemotePath(remotePath)}/`
 }
 
 async function remoteExists(box, remotePath) {
@@ -208,6 +214,25 @@ async function remoteUsage(box) {
   return { total, used, available, ratio: total > 0 ? used / total : 1 }
 }
 
+async function remoteFileSizes(box, remotePaths) {
+  const destination = `${assertSafeComponent(box.username, 'Storage Box username')}@${box.hostname}`
+  const sizes = []
+  for (let offset = 0; offset < remotePaths.length; offset += 100) {
+    const paths = remotePaths.slice(offset, offset + 100).map(assertSafeRemotePath)
+    const result = await runCommand('ssh', [
+      ...sshBaseArgs(box), destination, 'stat', '-c', '%s', ...paths,
+    ], { timeoutMs: 60_000 })
+    const values = result.stdout.trim().split(/\s+/).filter(Boolean)
+    if (values.length !== paths.length) throw new Error(`remote stat returned ${values.length}/${paths.length} file sizes`)
+    for (const value of values) {
+      const size = Number(value)
+      if (!Number.isSafeInteger(size) || size < 0) throw new Error(`remote stat returned invalid file size: ${value}`)
+      sizes.push(size)
+    }
+  }
+  return sizes
+}
+
 async function resolveAssetDirectory(video) {
   const relative = video.encodedPath?.trim()
     ? path.dirname(video.encodedPath)
@@ -226,6 +251,7 @@ async function inspectAndHashDirectory(root) {
   const overall = createHash('sha256')
   let totalBytes = 0
   let files = 0
+  const manifest = []
 
   async function walk(directory, relativeDirectory = '') {
     const entries = []
@@ -243,15 +269,18 @@ async function inspectAndHashDirectory(root) {
       }
       if (!entry.isFile()) throw new Error(`non-regular file rejected: ${relativePath}`)
       const info = await stat(fullPath)
+      assertSafeRemotePath(relativePath)
       overall.update(`F\0${relativePath}\0${info.size}\n`)
       totalBytes += info.size
       files++
+      manifest.push({ fullPath, relativePath, size: info.size })
     }
   }
 
   await walk(root)
   if (files === 0) throw new Error('asset directory is empty')
-  return { checksum: `size-sha256:${overall.digest('hex')}`, totalBytes, files }
+  manifest.sort((a, b) => b.size - a.size || a.relativePath.localeCompare(b.relativePath))
+  return { checksum: `size-sha256:${overall.digest('hex')}`, totalBytes, files, manifest }
 }
 
 async function inspectAndHashForArchive(root, videoId) {
@@ -262,61 +291,110 @@ async function inspectAndHashForArchive(root, videoId) {
   return inspection
 }
 
-function progressReporter(videoId, totalBytes, startedAt) {
-  let lastLogAt = 0
+function formatEta(seconds) {
+  if (!Number.isFinite(seconds) || seconds < 0) return '-'
+  const rounded = Math.round(seconds)
+  if (rounded < 60) return `${rounded}s`
+  return `${Math.floor(rounded / 60)}m${String(rounded % 60).padStart(2, '0')}s`
+}
+
+function curlCredentials(box) {
+  const credentials = `${box.username}:${box.ftpPassword}`
+  if (/[\0\r\n]/.test(credentials)) throw new Error(`invalid FTP credentials for Storage Box ${box.id}`)
+  return `user = "${credentials.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"\n`
+}
+
+function ftpUrl(box, remotePath) {
+  return `ftp://${box.hostname}:${box.ftpPort}/${assertSafeRemotePath(remotePath)}`
+}
+
+function makeCurlProgressReporter(box, videoId, totalBytes) {
+  const startedAt = Date.now()
+  let lastLogAt = startedAt
   let completionLogged = false
-  let buffered = ''
-  return chunk => {
-    buffered = (buffered + chunk).slice(-8192)
-    const progress = parseRcloneProgress(buffered)
-    if (!progress) return
-    const { bytes, percent } = progress
+  let completedBytes = 0
+  let currentFileBytes = 0
+  let currentSpeed = 0
+
+  function report(force = false) {
     const now = Date.now()
-    if (now - lastLogAt >= 1_000 || (percent === 100 && !completionLogged)) {
+    const bytes = Math.min(totalBytes, completedBytes + currentFileBytes)
+    const percent = totalBytes > 0 ? bytes / totalBytes * 100 : 100
+    if (force && percent >= 100 && completionLogged) return
+    if (force || now - lastLogAt >= FTP_PROGRESS_LOG_MS || (percent >= 100 && !completionLogged)) {
       lastLogAt = now
-      if (percent === 100) completionLogged = true
-      const speedBytesPerSecond = progress.speedBytesPerSecond ||
-        bytes / Math.max((Date.now() - startedAt) / 1000, 0.001)
-      log(`${videoId}: upload ${percent}% (${formatBytes(bytes)}/${formatBytes(totalBytes)}) at ${formatRate(speedBytesPerSecond)}`)
+      if (percent >= 100) completionLogged = true
+      const elapsedSeconds = Math.max((now - startedAt) / 1000, 0.001)
+      const averageSpeed = bytes / elapsedSeconds
+      const speed = currentSpeed || averageSpeed
+      const eta = speed > 0 ? (totalBytes - bytes) / speed : Infinity
+      console.log(`Box ${formatBoxLabel(box)}, Progress ${percent.toFixed(1)}% ${formatBytes(bytes)}/${formatBytes(totalBytes)}, Current ${formatRate(speed)}, Average ${formatRate(averageSpeed)}, ETA ${formatEta(eta)}, ID ${videoId}`)
     }
+  }
+
+  return {
+    forFile() {
+      let buffered = ''
+      currentFileBytes = 0
+      currentSpeed = 0
+      return chunk => {
+        buffered = (buffered + chunk).slice(-8192)
+        const lines = buffered.split(/[\r\n]+/)
+        buffered = lines.pop() || ''
+        for (const line of lines) {
+          const progress = parseCurlProgressLine(line)
+          if (!progress) continue
+          currentFileBytes = progress.bytes
+          currentSpeed = progress.speedBytesPerSecond
+          report()
+        }
+      }
+    },
+    fileComplete(bytes) {
+      completedBytes += bytes
+      currentFileBytes = 0
+      currentSpeed = 0
+      report(completedBytes >= totalBytes)
+    },
+    stats() {
+      const elapsedMs = Math.max(Date.now() - startedAt, 1)
+      return { elapsedMs, speedBytesPerSecond: totalBytes / (elapsedMs / 1000) }
+    },
   }
 }
 
-async function uploadDirectory(box, sourceDir, remotePath, videoId, totalBytes) {
-  const startedAt = Date.now()
-  const args = [
-    'sync', sourceDir, `:sftp:./${assertSafeRemotePath(remotePath)}`,
-    '--sftp-host', box.hostname,
-    '--sftp-user', box.username,
-    '--sftp-port', String(box.sshPort),
-    '--sftp-key-file', box.sshKeyPath,
-    '--sftp-known-hosts-file', box.knownHostsPath,
-    '--sftp-chunk-size', '255Ki',
-    '--sftp-concurrency', '128',
-    '--sftp-disable-hashcheck',
-    '--sftp-set-modtime=false',
-    '--size-only',
-    '--transfers', '1', '--checkers', '1', '--check-first',
-    '--stats', '1s', '--stats-one-line', '--stats-log-level', 'NOTICE',
-    '--log-level', 'NOTICE',
-  ]
-  await runCommand('rclone', args, { onOutput: progressReporter(videoId, totalBytes, startedAt) })
-  const elapsedMs = Math.max(Date.now() - startedAt, 1)
-  log(`${videoId}: upload complete in ${formatDuration(elapsedMs)}; average ${formatRate(totalBytes / (elapsedMs / 1000))}`)
+async function uploadDirectory(box, remotePath, videoId, inspection) {
+  const safeRemotePath = assertSafeRemotePath(remotePath)
+  await runSsh(box, 'rm', ['-rf', safeRemotePath], { timeoutMs: 120_000 })
+  await runSsh(box, 'mkdir', ['-p', safeRemotePath], { timeoutMs: 30_000 })
+
+  const reporter = makeCurlProgressReporter(box, videoId, inspection.totalBytes)
+  for (const file of inspection.manifest) {
+    await runCommand('curl', [
+      '--config', '-',
+      '--fail', '--show-error', '--ftp-pasv', '--ftp-create-dirs',
+      '--connect-timeout', '15',
+      '--upload-file', file.fullPath,
+      ftpUrl(box, `${safeRemotePath}/${file.relativePath}`),
+    ], {
+      input: curlCredentials(box),
+      onOutput: reporter.forFile(),
+    })
+    reporter.fileComplete(file.size)
+  }
+  const stats = reporter.stats()
+  log(`box ${box.id}: ${videoId}: FTP upload complete in ${formatDuration(stats.elapsedMs)}; average ${formatRate(stats.speedBytesPerSecond)}`)
 }
 
-async function verifyRemoteDirectory(box, sourceDir, remotePath) {
-  await runCommand('rclone', [
-    'check', sourceDir, `:sftp:./${assertSafeRemotePath(remotePath)}`,
-    '--size-only', '--checkers', '1',
-    '--sftp-host', box.hostname,
-    '--sftp-user', box.username,
-    '--sftp-port', String(box.sshPort),
-    '--sftp-key-file', box.sshKeyPath,
-    '--sftp-known-hosts-file', box.knownHostsPath,
-    '--sftp-disable-hashcheck',
-    '--log-level', 'NOTICE',
-  ])
+async function verifyRemoteDirectory(box, inspection, remotePath) {
+  const safeRemotePath = assertSafeRemotePath(remotePath)
+  const remotePaths = inspection.manifest.map(file => `${safeRemotePath}/${file.relativePath}`)
+  const sizes = await remoteFileSizes(box, remotePaths)
+  for (let index = 0; index < inspection.manifest.length; index++) {
+    if (sizes[index] !== inspection.manifest[index].size) {
+      throw new Error(`remote size mismatch for ${inspection.manifest[index].relativePath}: expected ${inspection.manifest[index].size}, got ${sizes[index]}`)
+    }
+  }
 }
 
 async function finalizeRemote(box, incomingPath, finalPath) {
@@ -349,6 +427,23 @@ const ELIGIBLE_SQL = `
       AND shared."encodedPath" = v."encodedPath"
   )`
 
+const STAGED_ELIGIBLE_SQL = `
+  v."storageId" = $1
+  AND v.status = 'active'
+  AND v."encodingStatus" = 'completed'
+  AND v."coldStorage"
+  AND v."coldStorageStatus" = 'staged'
+  AND COALESCE(v."lastView", v."createdAt") <= NOW() - make_interval(days => $2)
+  AND v."clonedFrom" IS NULL
+  AND NOT v."hasCopies"
+  AND NOT EXISTS (SELECT 1 FROM "Video" child WHERE child."clonedFrom" = v.id)
+  AND NOT EXISTS (
+    SELECT 1 FROM "Video" shared
+    WHERE shared.id <> v.id
+      AND v."encodedPath" <> ''
+      AND shared."encodedPath" = v."encodedPath"
+  )`
+
 async function localStorageId(client) {
   const ip = execFileSync('hostname', ['-I'], { encoding: 'utf8' }).trim().split(/\s+/)[0]
   const { rows } = await client.query(`SELECT id FROM "Server" WHERE ip = $1 AND type = 'storage'`, [ip])
@@ -369,11 +464,11 @@ async function countWaitingIngestTransfers(client, storageId) {
   return rows[0].count
 }
 
-async function waitForIngestCapacity(client, storageId) {
+async function waitForIngestCapacity(client, storageId, inactivityDays) {
   let paused = false
   let lastLogAt = 0
   while (!shuttingDown) {
-    if ((await fetchStagedBatch(client, storageId, 1)).ids.length > 0) return true
+    if ((await fetchStagedBatch(client, storageId, inactivityDays, 1)).ids.length > 0) return true
     const waiting = await countWaitingIngestTransfers(client, storageId)
     if (waiting <= MAX_WAITING_INGEST_TRANSFERS) {
       if (paused) {
@@ -395,7 +490,7 @@ async function waitForIngestCapacity(client, storageId) {
 
 async function loadStorageBoxes(client) {
   const { rows } = await client.query(
-    `SELECT id, hostname, username, "sshPort", "sshKeyPath",
+    `SELECT id, plan, hostname, username, "ftpPort", "ftpPassword", "sshPort", "sshKeyPath",
             "knownHostsPath", "basePath", "capacityBytes", "maxConnections",
             priority, "inactivityDays", "maxUsagePercent", "archiveConcurrency",
             "restoreConcurrency", "scanIntervalSeconds", "isActive",
@@ -408,6 +503,9 @@ async function loadStorageBoxes(client) {
   return rows.map(box => {
     if (!SAFE_COMPONENT.test(box.username) || !/^[-A-Za-z0-9.]+$/.test(box.hostname)) throw new Error(`unsafe connection details for Storage Box ${box.id}`)
     if (!box.sshKeyPath || !box.knownHostsPath) throw new Error(`SSH key paths are not configured for Storage Box ${box.id}`)
+    box.ftpPort = Number(box.ftpPort)
+    if (!Number.isInteger(box.ftpPort) || box.ftpPort < 1 || box.ftpPort > 65535) throw new Error(`invalid FTP port for Storage Box ${box.id}`)
+    if (typeof box.ftpPassword !== 'string' || !box.ftpPassword || /[\0\r\n]/.test(box.ftpPassword)) throw new Error(`FTP password is not configured for Storage Box ${box.id}`)
     box.basePath = assertSafeRemotePath(box.basePath)
     box.inactivityDays = Number(box.inactivityDays)
     box.archiveConcurrency = Number(box.archiveConcurrency)
@@ -524,7 +622,7 @@ async function dryRun(client, storageId, box, options) {
   }
 }
 
-async function fetchStagedBatch(client, storageId, limit) {
+async function fetchStagedBatch(client, storageId, inactivityDays, limit) {
   const { rows } = await client.query(
     `SELECT s."videoId" AS id, s.bytes AS "encodedSize"
      FROM cold_storage_staging s
@@ -532,12 +630,10 @@ async function fetchStagedBatch(client, storageId, limit) {
      WHERE s."storageId" = $1
        AND s.status = 'ready'
        AND (s."retryAt" IS NULL OR s."retryAt" <= NOW())
-       AND v.status = 'active'
-       AND v."coldStorage"
-       AND v."coldStorageStatus" = 'staged'
+       AND ${STAGED_ELIGIBLE_SQL}
      ORDER BY s."readyAt", s."videoId"
-     LIMIT $2`,
-    [storageId, limit]
+     LIMIT $3`,
+    [storageId, inactivityDays, limit]
   )
   return {
     ids: rows.map(row => row.id),
@@ -571,7 +667,7 @@ async function claimCandidate(client, storageId, inactivityDays, videoId) {
   return rows[0] || null
 }
 
-async function claimStagedCandidate(client, storageId, videoId) {
+async function claimStagedCandidate(client, storageId, inactivityDays, videoId) {
   await client.query('BEGIN')
   try {
     const { rows } = await client.query(
@@ -581,15 +677,13 @@ async function claimStagedCandidate(client, storageId, videoId) {
               s.checksum AS "stageChecksum"
        FROM cold_storage_staging s
        JOIN "Video" v ON v.id = s."videoId"
-       WHERE s."videoId" = $2
+       WHERE s."videoId" = $3
          AND s."storageId" = $1
          AND s.status = 'ready'
-         AND v."storageId" = $1
-         AND v.status = 'active'
-         AND v."coldStorage"
-         AND v."coldStorageStatus" = 'staged'
+         AND (s."retryAt" IS NULL OR s."retryAt" <= NOW())
+         AND ${STAGED_ELIGIBLE_SQL}
        FOR UPDATE OF s, v`,
-      [storageId, videoId]
+      [storageId, inactivityDays, videoId]
     )
     if (rows.length !== 1) {
       await client.query('ROLLBACK')
@@ -967,7 +1061,7 @@ async function processCandidate(pool, storageId, box, videoId, capacity) {
   let reserved = 0
   let slot = null
   try {
-    video = await claimStagedCandidate(client, storageId, videoId)
+    video = await claimStagedCandidate(client, storageId, box.inactivityDays, videoId)
       || await claimCandidate(client, storageId, box.inactivityDays, videoId)
     if (!video) return { action: 'stale' }
     const sourceDir = video.staged
@@ -1000,10 +1094,10 @@ async function processCandidate(pool, storageId, box, videoId, capacity) {
     const incomingPath = `${box.basePath}/incoming/${safeVideoId}`
 
     if (await remoteExists(box, finalPath)) {
-      await verifyRemoteDirectory(box, sourceDir, finalPath)
+      await verifyRemoteDirectory(box, inspection, finalPath)
     } else {
-      await uploadDirectory(box, sourceDir, incomingPath, video.id, inspection.totalBytes)
-      await verifyRemoteDirectory(box, sourceDir, incomingPath)
+      await uploadDirectory(box, incomingPath, video.id, inspection)
+      await verifyRemoteDirectory(box, inspection, incomingPath)
       await finalizeRemote(box, incomingPath, finalPath)
       if (!await remoteExists(box, finalPath)) throw new Error('remote final path is not visible after atomic move')
     }
@@ -1082,7 +1176,7 @@ async function processCandidate(pool, storageId, box, videoId, capacity) {
 }
 
 async function buildUploadLanes(client, boxes) {
-  const lanes = []
+  const boxLanes = []
   for (const box of boxes) {
     if (!box.reachable || !box.acceptingUploads || !box.usage) continue
     const reservation = await client.query(
@@ -1094,33 +1188,99 @@ async function buildUploadLanes(client, boxes) {
     const maximum = box.usage.total - box.minimumFreeBytes
     const available = maximum - box.usage.used - globallyReserved
     if (available <= 0) continue
-    lanes.push({
+    const capacity = {
+      used: box.usage.used + globallyReserved,
+      reserved: 0,
+      maximum,
+    }
+    const laneCount = Math.min(
+      TARGET_UPLOAD_LANES_PER_BOX,
+      box.archiveConcurrency,
+      Math.max(0, Number(box.maxConnections) - box.restoreConcurrency)
+    )
+    boxLanes.push(Array.from({ length: laneCount }, (_, laneIndex) => ({
       box,
+      lane: laneIndex + 1,
       available,
-      capacity: {
-        used: box.usage.used + globallyReserved,
-        reserved: 0,
-        maximum,
-      },
-    })
+      capacity,
+    })))
+  }
+  const lanes = []
+  for (let laneIndex = 0; laneIndex < TARGET_UPLOAD_LANES_PER_BOX; laneIndex++) {
+    for (const entries of boxLanes) {
+      if (entries[laneIndex]) lanes.push(entries[laneIndex])
+    }
   }
   return lanes
 }
 
-function assignOneCandidatePerBox(candidates, lanes, maximum) {
+function assignCandidatesToLanes(candidates, lanes, maximum) {
   const remainingLanes = [...lanes]
   const assignments = []
+  const plannedBytes = new Map()
   for (const candidate of candidates) {
     if (assignments.length >= maximum || remainingLanes.length === 0) break
     const bytes = Number(candidate.bytes)
-    const laneIndex = remainingLanes.findIndex(lane =>
-      !Number.isFinite(bytes) || bytes <= 0 || bytes <= lane.available
-    )
+    const laneIndex = remainingLanes.findIndex(lane => {
+      const alreadyPlanned = plannedBytes.get(lane.box.id) || 0
+      return !Number.isFinite(bytes) || bytes <= 0 || bytes <= lane.available - alreadyPlanned
+    })
     if (laneIndex === -1) continue
     const [lane] = remainingLanes.splice(laneIndex, 1)
+    if (Number.isFinite(bytes) && bytes > 0) {
+      plannedBytes.set(lane.box.id, (plannedBytes.get(lane.box.id) || 0) + bytes)
+    }
     assignments.push({ ...lane, id: candidate.id })
   }
   return assignments
+}
+
+async function runUploadWindow(pool, storageId, initialAssignments, candidates, maximum, label) {
+  const assignedIds = new Set(initialAssignments.map(assignment => assignment.id))
+  const pending = candidates.filter(candidate => !assignedIds.has(candidate.id))
+  const active = new Map()
+  const results = []
+  let launched = 0
+
+  function launch(assignment) {
+    const token = Symbol(assignment.id)
+    log(`box ${assignment.box.id}: selected ${assignment.id} (${label}); lane ${assignment.lane}`)
+    const promise = processCandidate(
+      pool,
+      storageId,
+      assignment.box,
+      assignment.id,
+      assignment.capacity
+    ).then(result => ({ token, assignment, result }))
+    active.set(token, promise)
+    launched++
+  }
+
+  function takeNext(lane) {
+    const available = lane.capacity.maximum - lane.capacity.used - lane.capacity.reserved
+    const index = pending.findIndex(candidate => {
+      const bytes = Number(candidate.bytes)
+      return !Number.isFinite(bytes) || bytes <= 0 || bytes <= available
+    })
+    if (index === -1) return null
+    const [candidate] = pending.splice(index, 1)
+    return { ...lane, id: candidate.id }
+  }
+
+  for (const assignment of initialAssignments) launch(assignment)
+  while (active.size > 0) {
+    const completed = await Promise.race(active.values())
+    active.delete(completed.token)
+    results.push({ boxId: completed.assignment.box.id, ...completed.result })
+
+    // Refill this exact lane immediately instead of waiting for slower lanes or
+    // Storage Boxes to finish their current video.
+    if (!shuttingDown && launched < maximum) {
+      const next = takeNext(completed.assignment)
+      if (next) launch(next)
+    }
+  }
+  return results
 }
 
 async function main() {
@@ -1148,7 +1308,8 @@ async function main() {
       if (!box.usage) continue
       log(`box ${box.id}: ${box.hostname}; usage ${formatBytes(box.usage.used)}/${formatBytes(box.usage.total)} (${(box.usage.ratio * 100).toFixed(2)}%); ${formatBytes(box.remaining)} free`)
       log(`box ${box.id}: ${box.inactivityDays} inactive days; ${box.archiveConcurrency} archive + ${box.restoreConcurrency} restore connections`)
-      log(`box ${box.id}: one parallel upload lane; auto-disables uploads at ${formatBytes(box.minimumFreeBytes)} free`)
+      const laneCount = Math.min(TARGET_UPLOAD_LANES_PER_BOX, box.archiveConcurrency, box.maxConnections - box.restoreConcurrency)
+      log(`box ${box.id}: up to ${laneCount} parallel upload lanes; auto-disables uploads at ${formatBytes(box.minimumFreeBytes)} free`)
     }
 
     let handled = 0
@@ -1157,34 +1318,39 @@ async function main() {
       boxes = await refreshStorageBoxUsage(control, boxes)
       const boxesById = new Map(boxes.map(box => [box.id, box]))
 
-      // Permanent policy deletions always get a chance to release remote space,
-      // even while the emergency local staging queue remains busy.
-      if (await purgeTerminalColdVideo(pool, storageId, boxesById)) continue
-
       const lanes = await buildUploadLanes(control, boxes)
       if (lanes.length === 0) {
+        // A full or temporarily unavailable box can still benefit from deleting
+        // one terminal cold copy, but deletion must never starve local uploads.
+        if (await purgeTerminalColdVideo(pool, storageId, boxesById)) continue
         log(`no reachable Storage Box has more than ${formatBytes(DEFAULT_MINIMUM_FREE_BYTES)} free; rechecking automatically`)
         if (options.once) break
         await sleep(Math.min(...boxes.map(box => box.scanIntervalMs)))
         continue
       }
-      const remainingLimit = options.limit === null
+      const initialLimit = options.limit === null
         ? lanes.length
         : Math.min(lanes.length, options.limit - handled)
+      const windowLimit = options.once
+        ? initialLimit
+        : options.limit === null
+          ? initialLimit * UPLOAD_WINDOW_PER_LANE
+          : Math.min(initialLimit * UPLOAD_WINDOW_PER_LANE, options.limit - handled)
+      const stagedInactivityDays = Math.max(...lanes.map(lane => lane.box.inactivityDays))
       let stagedBatch = options.videoId
         ? { ids: [], candidates: [], label: 'empty' }
-        : await fetchStagedBatch(control, storageId, remainingLimit)
+        : await fetchStagedBatch(control, storageId, stagedInactivityDays, windowLimit)
       let hasStagedBatch = stagedBatch.ids.length > 0
       if (!hasStagedBatch) {
-        if (!await waitForIngestCapacity(control, storageId)) break
+        if (!await waitForIngestCapacity(control, storageId, stagedInactivityDays)) break
         stagedBatch = options.videoId
           ? { ids: [], candidates: [], label: 'empty' }
-          : await fetchStagedBatch(control, storageId, remainingLimit)
+          : await fetchStagedBatch(control, storageId, stagedInactivityDays, windowLimit)
         hasStagedBatch = stagedBatch.ids.length > 0
       }
       // Staged uploads drain the emergency root buffer and bypass the ingest queue
       // gate. Normal /home archives still yield to production transfers.
-      if (!hasStagedBatch && !await waitForIngestCapacity(control, storageId)) break
+      if (!hasStagedBatch && !await waitForIngestCapacity(control, storageId, stagedInactivityDays)) break
       let candidates
       let label
       if (options.videoId && handled === 0) {
@@ -1195,32 +1361,32 @@ async function main() {
         label = stagedBatch.label
       } else {
         const inactivityDays = Math.max(...lanes.map(lane => lane.box.inactivityDays))
-        candidates = await fetchParallelCandidates(control, storageId, inactivityDays, remainingLimit * 4)
+        candidates = await fetchParallelCandidates(control, storageId, inactivityDays, windowLimit * 4)
         label = 'eligible local'
       }
-      const assignments = assignOneCandidatePerBox(candidates, lanes, remainingLimit)
+      const assignments = assignCandidatesToLanes(candidates, lanes, initialLimit)
       if (assignments.length === 0) {
+        if (await purgeTerminalColdVideo(pool, storageId, boxesById)) continue
         log('no eligible videos found')
         if (options.once) break
         await sleep(Math.min(...boxes.map(box => box.scanIntervalMs)))
         continue
       }
-      for (const assignment of assignments) {
-        log(`box ${assignment.box.id}: selected ${assignment.id} (${label}); one lane for this box`)
-      }
       const batchStartedAt = Date.now()
-      const results = await Promise.all(assignments.map(async assignment => ({
-        boxId: assignment.box.id,
-        ...(await processCandidate(pool, storageId, assignment.box, assignment.id, assignment.capacity)),
-      })))
+      const results = await runUploadWindow(pool, storageId, assignments, candidates, windowLimit, label)
       handled += results.length
       const archived = results.filter(result => result.action === 'archived')
       const freed = archived.reduce((sum, result) => sum + result.bytes, 0)
       const batchElapsedMs = Math.max(Date.now() - batchStartedAt, 1)
       const batchRate = freed > 0 ? `; effective ${formatRate(freed / (batchElapsedMs / 1000))}` : ''
       const byteAction = hasStagedBatch ? 'drained from staging' : 'freed from /home'
-      log(`multi-box batch complete: ${archived.length}/${results.length} archived across ${assignments.length} box lane(s); ${formatBytes(freed)} ${byteAction} in ${formatDuration(batchElapsedMs)}${batchRate}; ${handled} handled this run`)
+      const boxesUsed = new Set(assignments.map(assignment => assignment.box.id)).size
+      log(`multi-box window complete: ${archived.length}/${results.length} archived across ${boxesUsed} box(es) / peak ${assignments.length} lane(s); ${formatBytes(freed)} ${byteAction} in ${formatDuration(batchElapsedMs)}${batchRate}; ${handled} handled this run`)
       if (options.once) break
+
+      // Keep permanent remote deletion moving without allowing its backlog to
+      // delay the next local-space recovery batch indefinitely.
+      if (!shuttingDown) await purgeTerminalColdVideo(pool, storageId, boxesById)
     }
   } finally {
     if (lockHeld) await control.query(`SELECT pg_advisory_unlock(hashtext($1))`, [lockName]).catch(() => {})

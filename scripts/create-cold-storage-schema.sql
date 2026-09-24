@@ -11,6 +11,8 @@ CREATE TABLE IF NOT EXISTS storage_boxes (
   plan text NOT NULL,
   hostname text NOT NULL UNIQUE,
   username text NOT NULL,
+  "ftpPort" integer NOT NULL DEFAULT 21,
+  "ftpPassword" text,
   "sshPort" integer NOT NULL DEFAULT 23,
   "sshKeyPath" text NOT NULL,
   "knownHostsPath" text NOT NULL DEFAULT '/root/.ssh/known_hosts',
@@ -22,7 +24,7 @@ CREATE TABLE IF NOT EXISTS storage_boxes (
   "acceptingUploads" boolean NOT NULL DEFAULT true,
   "maxConnections" integer NOT NULL DEFAULT 10,
   priority integer NOT NULL DEFAULT 100,
-  "inactivityDays" integer NOT NULL DEFAULT 15,
+  "inactivityDays" integer NOT NULL DEFAULT 8,
   "maxUsagePercent" numeric(5,2) NOT NULL DEFAULT 99,
   "archiveConcurrency" integer NOT NULL DEFAULT 6,
   "restoreConcurrency" integer NOT NULL DEFAULT 2,
@@ -31,6 +33,7 @@ CREATE TABLE IF NOT EXISTS storage_boxes (
   "createdAt" timestamp without time zone NOT NULL DEFAULT CURRENT_TIMESTAMP,
   "updatedAt" timestamp without time zone NOT NULL DEFAULT CURRENT_TIMESTAMP,
   CONSTRAINT storage_boxes_ssh_port_check CHECK ("sshPort" BETWEEN 1 AND 65535),
+  CONSTRAINT storage_boxes_ftp_port_check CHECK ("ftpPort" BETWEEN 1 AND 65535),
   CONSTRAINT storage_boxes_capacity_check CHECK ("capacityBytes" > 0),
   CONSTRAINT storage_boxes_used_bytes_check CHECK ("usedBytes" >= 0),
   CONSTRAINT storage_boxes_minimum_free_check CHECK ("minimumFreeBytes" >= 0),
@@ -49,11 +52,13 @@ CREATE TABLE IF NOT EXISTS storage_boxes (
 -- earlier version of this migration.
 ALTER TABLE storage_boxes
   ADD COLUMN IF NOT EXISTS "sshKeyPath" text,
+  ADD COLUMN IF NOT EXISTS "ftpPort" integer NOT NULL DEFAULT 21,
+  ADD COLUMN IF NOT EXISTS "ftpPassword" text,
   ADD COLUMN IF NOT EXISTS "knownHostsPath" text NOT NULL DEFAULT '/root/.ssh/known_hosts',
   ADD COLUMN IF NOT EXISTS "minimumFreeBytes" bigint NOT NULL DEFAULT 100000000000,
   ADD COLUMN IF NOT EXISTS "acceptingUploads" boolean NOT NULL DEFAULT true,
   ADD COLUMN IF NOT EXISTS priority integer NOT NULL DEFAULT 100,
-  ADD COLUMN IF NOT EXISTS "inactivityDays" integer NOT NULL DEFAULT 15,
+  ADD COLUMN IF NOT EXISTS "inactivityDays" integer NOT NULL DEFAULT 8,
   ADD COLUMN IF NOT EXISTS "maxUsagePercent" numeric(5,2) NOT NULL DEFAULT 99,
   ADD COLUMN IF NOT EXISTS "archiveConcurrency" integer NOT NULL DEFAULT 6,
   ADD COLUMN IF NOT EXISTS "restoreConcurrency" integer NOT NULL DEFAULT 2,
@@ -88,6 +93,9 @@ DO $$
 BEGIN
   IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid = 'storage_boxes'::regclass AND conname = 'storage_boxes_priority_check') THEN
     ALTER TABLE storage_boxes ADD CONSTRAINT storage_boxes_priority_check CHECK (priority >= 0) NOT VALID;
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid = 'storage_boxes'::regclass AND conname = 'storage_boxes_ftp_port_check') THEN
+    ALTER TABLE storage_boxes ADD CONSTRAINT storage_boxes_ftp_port_check CHECK ("ftpPort" BETWEEN 1 AND 65535) NOT VALID;
   END IF;
   IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid = 'storage_boxes'::regclass AND conname = 'storage_boxes_minimum_free_check') THEN
     ALTER TABLE storage_boxes ADD CONSTRAINT storage_boxes_minimum_free_check CHECK ("minimumFreeBytes" >= 0) NOT VALID;
@@ -157,17 +165,17 @@ INSERT INTO storage_boxes (
 ) VALUES (
   'hetzner-bx21-u654289',
   'hetzner',
-  'BX21',
+  'BX31',
   'u654289.your-storagebox.de',
   'u654289',
   23,
   '/root/.ssh/firestream-storagebox-u654289',
   '/root/.ssh/known_hosts',
   'firestream/cold-videos',
-  5000000000000,
+  10995116277760,
   10,
   100,
-  15,
+  8,
   99,
   8,
   2,
@@ -212,7 +220,7 @@ INSERT INTO storage_boxes (
   131072,
   10,
   200,
-  15,
+  8,
   99,
   8,
   2,
@@ -240,6 +248,7 @@ ON CONFLICT (id) DO UPDATE SET
 
 ALTER TABLE storage_boxes ALTER COLUMN "sshKeyPath" SET NOT NULL;
 ALTER TABLE storage_boxes VALIDATE CONSTRAINT storage_boxes_priority_check;
+ALTER TABLE storage_boxes VALIDATE CONSTRAINT storage_boxes_ftp_port_check;
 ALTER TABLE storage_boxes VALIDATE CONSTRAINT storage_boxes_minimum_free_check;
 ALTER TABLE storage_boxes VALIDATE CONSTRAINT storage_boxes_inactivity_days_check;
 ALTER TABLE storage_boxes VALIDATE CONSTRAINT storage_boxes_max_usage_check;

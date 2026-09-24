@@ -7,8 +7,8 @@ import { INGEST_DIR } from '../config.js'
 
 const DATABASE_URL = process.env.DATABASE_URL
 const STAGE_ROOT = process.env.COLD_STAGE_ROOT || '/cold-stage'
-const STAGE_CAP_BYTES = 1_500_000_000_000
-const MIN_ROOT_AVAILABLE_BYTES = 400_000_000_000
+const STAGE_CAP_BYTES = 1_800_000_000_000
+const MIN_ROOT_AVAILABLE_BYTES = 172_000_000_000
 const COPY_CONCURRENCY = 2
 const SCAN_INTERVAL_MS = 5_000
 const RETRY_MINUTES = 30
@@ -114,7 +114,7 @@ async function stageUsage(client, storageId) {
   return Number(rows[0].bytes)
 }
 
-async function fetchCandidates(client, storageId, days, limit) {
+async function fetchCandidates(client, storageId, days, allowance, limit) {
   const { rows } = await client.query(
     `SELECT v.id, v."userId", v."encodedPath", v."encodedSize", v."lastView", v."createdAt"
      FROM "Video" v
@@ -133,9 +133,11 @@ async function fetchCandidates(client, storageId, days, limit) {
          WHERE shared.id <> v.id AND v."encodedPath" <> '' AND shared."encodedPath" = v."encodedPath"
        )
        AND NOT EXISTS (SELECT 1 FROM cold_storage_staging s WHERE s."videoId" = v.id)
+       AND v."encodedSize" > 0
+       AND v."encodedSize" <= $3
      ORDER BY NULLIF(v."encodedSize", 0) DESC NULLS LAST, v.id
-     LIMIT $3`,
-    [storageId, days, limit]
+     LIMIT $4`,
+    [storageId, days, allowance, limit]
   )
   return rows
 }
@@ -368,7 +370,7 @@ async function main() {
         continue
       }
       const remaining = options.limit === null ? COPY_CONCURRENCY : Math.min(COPY_CONCURRENCY, options.limit - handled)
-      const candidates = await fetchCandidates(control, storageId, days, remaining * 4)
+      const candidates = await fetchCandidates(control, storageId, days, allowance, remaining * 4)
       const selected = []
       let reserved = 0
       for (const video of candidates) {
