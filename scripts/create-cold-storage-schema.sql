@@ -246,6 +246,51 @@ ON CONFLICT (id) DO UPDATE SET
   "isActive" = EXCLUDED."isActive",
   "updatedAt" = CURRENT_TIMESTAMP;
 
+INSERT INTO storage_boxes (
+  id, provider, plan, hostname, username, "sshPort", "sshKeyPath",
+  "knownHostsPath", "basePath", "capacityBytes", "usedBytes",
+  "maxConnections", priority, "inactivityDays", "maxUsagePercent",
+  "archiveConcurrency", "restoreConcurrency", "scanIntervalSeconds", "isActive"
+) VALUES (
+  'hetzner-bx21-u713027',
+  'hetzner',
+  'BX21',
+  'u713027.your-storagebox.de',
+  'u713027',
+  23,
+  '/root/.ssh/firestream-storagebox-u654289',
+  '/root/.ssh/known_hosts',
+  'firestream/cold-videos',
+  5497558138880,
+  131072,
+  10,
+  300,
+  8,
+  99,
+  8,
+  2,
+  60,
+  true
+)
+ON CONFLICT (id) DO UPDATE SET
+  provider = EXCLUDED.provider,
+  plan = EXCLUDED.plan,
+  hostname = EXCLUDED.hostname,
+  username = EXCLUDED.username,
+  "sshPort" = EXCLUDED."sshPort",
+  "sshKeyPath" = EXCLUDED."sshKeyPath",
+  "knownHostsPath" = EXCLUDED."knownHostsPath",
+  "basePath" = EXCLUDED."basePath",
+  "maxConnections" = EXCLUDED."maxConnections",
+  priority = EXCLUDED.priority,
+  "inactivityDays" = EXCLUDED."inactivityDays",
+  "maxUsagePercent" = EXCLUDED."maxUsagePercent",
+  "archiveConcurrency" = EXCLUDED."archiveConcurrency",
+  "restoreConcurrency" = EXCLUDED."restoreConcurrency",
+  "scanIntervalSeconds" = EXCLUDED."scanIntervalSeconds",
+  "isActive" = EXCLUDED."isActive",
+  "updatedAt" = CURRENT_TIMESTAMP;
+
 ALTER TABLE storage_boxes ALTER COLUMN "sshKeyPath" SET NOT NULL;
 ALTER TABLE storage_boxes VALIDATE CONSTRAINT storage_boxes_priority_check;
 ALTER TABLE storage_boxes VALIDATE CONSTRAINT storage_boxes_ftp_port_check;

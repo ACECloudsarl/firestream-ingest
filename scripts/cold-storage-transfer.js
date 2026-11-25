@@ -454,11 +454,15 @@ async function localStorageId(client) {
 async function countWaitingIngestTransfers(client, storageId) {
   const { rows } = await client.query(
     `SELECT count(*)::int AS count
-     FROM "Video"
-     WHERE status = 'active'
-       AND "encodingStatus" = 'completed'
-       AND "transferStatus" = 'pending'
-       AND ("storageId" = $1 OR "storageId" IS NULL)`,
+     FROM "Video" v
+     JOIN "Server" encoder
+       ON encoder.id = v."encoderId"
+      AND encoder.type = 'encoder'
+      AND encoder."isActive" = true
+     WHERE v.status = 'active'
+       AND v."encodingStatus" = 'completed'
+       AND v."transferStatus" = 'pending'
+       AND (v."storageId" = $1 OR v."storageId" IS NULL)`,
     [storageId]
   )
   return rows[0].count

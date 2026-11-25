@@ -45,6 +45,11 @@ server {
         add_header Access-Control-Allow-Methods "GET, HEAD, OPTIONS" always;
         add_header Access-Control-Allow-Headers "Range, Accept, Content-Type" always;
 
+        # Serve local MP4s directly; only a missing file checks cold staging.
+        location ~* \.mp4$ {
+            error_page 404 = @staged_mp4;
+        }
+
         # HLS playlists — low cache
         location ~* \.m3u8$ {
             expires 1s;
@@ -86,6 +91,20 @@ server {
             add_header Cache-Control "public, immutable";
             add_header Access-Control-Allow-Origin "*" always;
         }
+    }
+
+    # Internal fallback preserves the public URL and native byte-range serving.
+    location @staged_mp4 {
+        root /cold-stage/videos;
+        rewrite ^/encodings/(.*)$ /$1 break;
+
+        sendfile on;
+        tcp_nopush on;
+        tcp_nodelay on;
+
+        add_header Access-Control-Allow-Origin "*" always;
+        add_header Access-Control-Allow-Methods "GET, HEAD, OPTIONS" always;
+        add_header Access-Control-Allow-Headers "Range, Accept, Content-Type" always;
     }
 
     # ── Misc (posters, thumbnails, scrub sprites) ──────────────────

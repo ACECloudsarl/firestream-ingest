@@ -67,11 +67,16 @@ async function getStorageId() {
 // ── Resolve encoder URL ─────────────────────────────────────────────
 async function resolveEncoderUrl(encoderId) {
   const { rows } = await getPool().query(
-    'SELECT hostname, port FROM "Server" WHERE id = $1',
+    'SELECT hostname, port, type, "isActive" FROM "Server" WHERE id = $1',
     [encoderId]
   )
   if (rows.length === 0) {
     throw new Error(`No Server row for encoderId ${encoderId}`)
+  }
+  if (rows[0].type !== 'encoder' || !rows[0].isActive) {
+    const error = new Error(`Encoder ${encoderId} is disabled`)
+    error.code = 'ENCODER_DISABLED'
+    throw error
   }
   let hostname = rows[0].hostname
   if (!hostname) {
@@ -91,15 +96,19 @@ async function claimPendingVideos(limit) {
     await client.query('BEGIN')
     // Lock rows to prevent race conditions
     const { rows } = await client.query(
-      `SELECT id, "userId", "encoderId", "encodedSize", "isMulti"
-       FROM "Video"
-       WHERE status = 'active'
-         AND "encodingStatus" = 'completed'
-         AND "transferStatus" = 'pending'
-         AND ("storageId" = $1 OR "storageId" IS NULL)
-       ORDER BY "createdAt" ASC
+      `SELECT v.id, v."userId", v."encoderId", v."encodedSize", v."isMulti"
+       FROM "Video" v
+       JOIN "Server" encoder
+         ON encoder.id = v."encoderId"
+        AND encoder.type = 'encoder'
+        AND encoder."isActive" = true
+       WHERE v.status = 'active'
+         AND v."encodingStatus" = 'completed'
+         AND v."transferStatus" = 'pending'
+         AND (v."storageId" = $1 OR v."storageId" IS NULL)
+       ORDER BY v."createdAt" ASC
        LIMIT $2
-       FOR UPDATE SKIP LOCKED`,
+       FOR UPDATE OF v SKIP LOCKED`,
       [await getStorageId(), limit]
     )
     if (rows.length > 0) {
@@ -364,6 +373,17 @@ async function transferVideo(video) {
     encoderUrl = await resolveEncoderUrl(encoderId)
     log(`[${label}] Encoder: ${encoderUrl}`)
   } catch (err) {
+    if (err.code === 'ENCODER_DISABLED') {
+      log(`[${label}] DEFERRED: ${err.message}`)
+      await getPool().query(
+        `UPDATE "Video"
+         SET "transferStatus" = 'pending', "encodingProgress" = 0,
+             reason = $2, "updatedAt" = NOW()
+         WHERE id = $1 AND "transferStatus" = 'transferring'`,
+        [videoId, err.message]
+      )
+      return
+    }
     log(`[${label}] ERROR resolving encoder: ${err.message}`)
     await failTransfer(videoId, `encoder resolve: ${err.message}`)
     return

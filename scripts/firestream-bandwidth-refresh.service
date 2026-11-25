@@ -1,0 +1,10 @@
+[Unit]
+Description=Refresh FireStream Storage Box bandwidth destinations
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/firestream-ingest
+Environment=PATH=/root/.nvm/versions/node/v26.3.1/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStart=/bin/bash /opt/firestream-ingest/limitPort.sh --refresh
